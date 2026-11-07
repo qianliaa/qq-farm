@@ -245,10 +245,11 @@ function showAuth() {
 }
 
 async function submitAuth() {
+  const username = ($('#authUsername') && $('#authUsername').value.trim()) || '';
   const password = $('#authPassword').value;
   $('#authError').classList.add('hidden');
   try {
-    const data = await rawApi('/api/login', { method: 'POST', body: JSON.stringify({ password }) });
+    const data = await rawApi('/api/login', { method: 'POST', body: JSON.stringify({ username, password }) });
     if (data && data.token) {
       try {
         sessionStorage.setItem(TOKEN_KEY, data.token);
@@ -275,6 +276,7 @@ async function loadBootstrap({ renderTasks = true } = {}) {
 
 function applyBootstrap(data, { renderTasks = true } = {}) {
   state.accounts = data.accounts || [];
+  state.user = data.user || null;
   state.settings = data.settings || {};
   state.taskMeta = data.taskMeta || {};
   state.engine = data.engine || 'checking';
@@ -1233,6 +1235,96 @@ function fillSettings() {
     ? `安装位置：${runtime.template}${runtime.installLog ? `；日志：${runtime.installLog}` : ''}`
     : '首次使用需安装 Linux QQ 与 NapCat，安装包与日志保存在数据目录。';
   if ($('#setVersion')) $('#setVersion').textContent = `v${health.version || '2.0.8'}`;
+  // 用户管理仅主用户可见可用；普通用户打开设置也只读。
+  const isAdmin = Boolean(state.user && state.user.admin);
+  const box = $('#userManageBox');
+  if (box) box.classList.toggle('hidden', !isAdmin);
+  const saveBtn = $('#btnSaveSettings');
+  if (saveBtn) saveBtn.classList.toggle('hidden', !isAdmin);
+  if (isAdmin) loadUsers();
+}
+
+/* ------------------------------- 用户管理 ------------------------------- */
+
+async function loadUsers() {
+  const list = $('#userList');
+  if (!list) return;
+  try {
+    const data = await api('/api/users');
+    const users = data.users || [];
+    if (!users.length) {
+      list.innerHTML = '<small style="opacity:.6">还没有额外用户。为其他飞牛用户各建一个账号空间吧。</small>';
+      return;
+    }
+    list.innerHTML = users
+      .map(
+        (u) => `<div class="runtime-setting-actions" style="align-items:center;margin:6px 0">
+          <b style="flex:1;min-width:0">${esc(u.name)}</b>
+          <small style="opacity:.7">${u.accounts} 个账号</small>
+          <button class="ghost-btn small" data-reset="${esc(u.id)}" data-name="${esc(u.name)}">重置密码</button>
+          <button class="ghost-btn small" data-del="${esc(u.id)}" data-name="${esc(u.name)}">删除</button>
+        </div>`
+      )
+      .join('');
+  } catch (error) {
+    list.innerHTML = `<small style="opacity:.6">加载失败：${esc(error.message)}</small>`;
+  }
+}
+
+async function addUser() {
+  const name = $('#newUserName').value.trim();
+  const password = $('#newUserPassword').value;
+  if (!name || !password) {
+    toast('请填写用户名和初始密码', 'warn');
+    return;
+  }
+  try {
+    await api('/api/users', { method: 'POST', body: JSON.stringify({ name, password }) });
+    $('#newUserName').value = '';
+    $('#newUserPassword').value = '';
+    toast(`已创建用户「${name}」`, 'success');
+    loadUsers();
+  } catch (error) {
+    toast(`创建失败：${error.message}`, 'error');
+  }
+}
+
+/** 复用确认弹窗收集一个新密码（confirmText 支持 HTML）。 */
+function askPassword(title) {
+  $('#confirmTitle').textContent = title;
+  $('#confirmText').innerHTML =
+    '<input id="askPasswordInput" type="password" placeholder="新密码（至少 6 位）" style="width:100%;box-sizing:border-box">';
+  $('#confirmOk').textContent = '确定';
+  openModal('confirmModal');
+  return new Promise((resolve) => {
+    state.confirmResolver = (ok) => {
+      const input = $('#askPasswordInput');
+      resolve(ok && input ? input.value : '');
+    };
+  });
+}
+
+async function resetUserPassword(id, name) {
+  const password = await askPassword(`重置「${name}」的密码`);
+  if (!password) return;
+  try {
+    await api(`/api/users/${id}/password`, { method: 'POST', body: JSON.stringify({ password }) });
+    toast(`已重置「${name}」的密码`, 'success');
+  } catch (error) {
+    toast(`重置失败：${error.message}`, 'error');
+  }
+}
+
+async function deleteUser(id, name) {
+  const ok = await askConfirm('删除用户', `确定删除用户「${esc(name)}」吗？其名下账号需先删除。`, '删除');
+  if (!ok) return;
+  try {
+    await api(`/api/users/${id}`, { method: 'DELETE' });
+    toast(`已删除用户「${name}」`, 'success');
+    loadUsers();
+  } catch (error) {
+    toast(`删除失败：${error.message}`, 'error');
+  }
 }
 
 async function checkUpdate() {
@@ -1315,6 +1407,20 @@ function bindEvents() {
   $('#authPassword').addEventListener('keydown', (event) => {
     if (event.key === 'Enter') submitAuth();
   });
+  if ($('#authUsername')) {
+    $('#authUsername').addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') submitAuth();
+    });
+  }
+  if ($('#btnAddUser')) $('#btnAddUser').addEventListener('click', addUser);
+  if ($('#userList')) {
+    $('#userList').addEventListener('click', (event) => {
+      const btn = event.target.closest('button');
+      if (!btn) return;
+      if (btn.dataset.reset) resetUserPassword(btn.dataset.reset, btn.dataset.name || '');
+      if (btn.dataset.del) deleteUser(btn.dataset.del, btn.dataset.name || '');
+    });
+  }
 
   $('#accountList').addEventListener('click', (event) => {
     const item = event.target.closest('.account-item');

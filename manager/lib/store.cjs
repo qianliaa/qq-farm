@@ -111,6 +111,7 @@ class Store {
       version: 1,
       settings: clone(DEFAULT_SETTINGS),
       accounts: [],
+      users: [],
     };
     this.saveTimer = null;
     this.load();
@@ -128,6 +129,7 @@ class Store {
         version: 1,
         settings: { ...DEFAULT_SETTINGS, ...(raw.settings || {}) },
         accounts: Array.isArray(raw.accounts) ? raw.accounts : [],
+        users: Array.isArray(raw.users) ? raw.users : [],
       };
       for (const account of this.data.accounts) {
         account.tasks = { ...defaultTasks(), ...(account.tasks || {}) };
@@ -192,6 +194,34 @@ class Store {
     this.data.settings = next;
     this.saveNow();
     return next;
+  }
+
+  /* 额外用户（飞牛用户间隔离）：主用户不落表，使用安装向导的访问密码。 */
+
+  get users() {
+    return this.data.users;
+  }
+
+  findUserByName(name) {
+    return this.data.users.find((u) => u.name === name) || null;
+  }
+
+  findUser(id) {
+    return this.data.users.find((u) => u.id === id) || null;
+  }
+
+  addUser(user) {
+    this.data.users.push(user);
+    this.saveNow();
+    return user;
+  }
+
+  removeUser(id) {
+    const index = this.data.users.findIndex((u) => u.id === id);
+    if (index < 0) return null;
+    const [removed] = this.data.users.splice(index, 1);
+    this.saveNow();
+    return removed;
   }
 
   recordOnline(account, userId, nickname) {

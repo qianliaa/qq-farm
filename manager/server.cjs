@@ -13,7 +13,7 @@ const { Logger } = require('./lib/logger.cjs');
 const napcat = require('./lib/napcat.cjs');
 const { TaskEngine, TASK_KEYS, TASK_META } = require('./lib/tasks.cjs');
 
-const APP_VERSION = '2.0.13';
+const APP_VERSION = '2.0.14';
 const UPDATE_REPO = (process.env.QQNAS_UPDATE_REPO || 'qianliaa/qq-online').trim();
 const PORT = Number(process.env.PORT) || 8787;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -187,9 +187,25 @@ function passwordHash(password) {
   return crypto.createHash('sha256').update(`${password}:qqnas`).digest('hex');
 }
 
-function isAuthed(req) {
-  if (!ACCESS_PASSWORD) return true;
-  const expected = passwordHash(ACCESS_PASSWORD);
+/** 额外用户的密码哈希与用户名绑定，改名即失效。 */
+function userPasswordHash(name, password) {
+  return crypto.createHash('sha256').update(`${name}:${password}:qqnas-user`).digest('hex');
+}
+
+/** 会话令牌由用户身份与密码哈希派生：重启不失效，改密即失效。 */
+function sessionToken(userId, secret) {
+  return crypto.createHash('sha256').update(`token:${userId}:${secret}:qqnas`).digest('hex');
+}
+
+/** 主用户（安装向导设置的访问密码）不落用户表，id 固定为 admin。 */
+const ADMIN_USER = { id: 'admin', name: '主用户', admin: true };
+
+/** 飞牛用户间隔离：账号归属当前登录用户；旧数据没有 owner，归主用户。 */
+function owns(user, account) {
+  return (account.owner || 'admin') === user.id;
+}
+
+function requestToken(req) {
   const cookies = parseCookies(req);
   let actual = cookies.qqnas_auth || '';
   if (!actual) {
@@ -202,8 +218,24 @@ function isAuthed(req) {
       if (match) actual = match[1].trim();
     }
   }
-  if (actual.length !== expected.length) return false;
-  return crypto.timingSafeEqual(Buffer.from(actual), Buffer.from(expected));
+  return actual;
+}
+
+function resolveAuthUser(req) {
+  if (!ACCESS_PASSWORD) return ADMIN_USER;
+  const actual = requestToken(req);
+  if (!actual) return null;
+  if (safeEqual(actual, sessionToken('admin', passwordHash(ACCESS_PASSWORD)))) return ADMIN_USER;
+  for (const user of store.users) {
+    if (safeEqual(actual, sessionToken(user.id, user.passwordHash))) {
+      return { id: user.id, name: user.name, admin: false };
+    }
+  }
+  return null;
+}
+
+function isAuthed(req) {
+  return Boolean(resolveAuthUser(req));
 }
 
 function safeEqual(a, b) {
@@ -559,7 +591,7 @@ async function probeAccount(account, { force = false } = {}) {
 
 /* ------------------------------ 业务操作 ------------------------------ */
 
-async function createAccount({ alias }) {
+async function createAccount({ alias, owner }) {
   if (MOCK) {
     const account = createAccountRecord(alias || '演示账号');
     account.containerId = 'mock';
@@ -567,11 +599,13 @@ async function createAccount({ alias }) {
     account.desiredState = 'running';
     account.webuiPort = 6099;
     account.onebotPort = 3000;
+    account.owner = owner || 'admin';
     store.add(account);
     return account;
   }
 
   const account = createAccountRecord(alias);
+  account.owner = owner || 'admin';
   account.webuiPort = await allocatePort(store.accounts, 'webuiPort', 6099);
   account.onebotPort = await allocatePort(store.accounts, 'onebotPort', 3000);
   account.desiredState = 'running';
@@ -639,21 +673,40 @@ async function handleApi(req, res, url) {
   }
 
   if (url.pathname === '/api/session' && method === 'GET') {
-    return json(res, 200, { authRequired: Boolean(ACCESS_PASSWORD), authed: isAuthed(req) });
+    const current = resolveAuthUser(req);
+    return json(res, 200, {
+      authRequired: Boolean(ACCESS_PASSWORD),
+      authed: Boolean(current),
+      user: current ? { id: current.id, name: current.name, admin: current.admin } : null,
+    });
   }
 
   if (url.pathname === '/api/login' && method === 'POST') {
     const body = await readBody(req);
-    if (!ACCESS_PASSWORD) return json(res, 200, { ok: true });
-    if (!safeEqual(body.password || '', ACCESS_PASSWORD)) {
-      return json(res, 401, { error: '访问密码不正确' });
+    if (!ACCESS_PASSWORD) return json(res, 200, { ok: true, user: ADMIN_USER });
+    const username = String(body.username || '').trim();
+    let user = null;
+    let token = '';
+    if (!username) {
+      // 用户名留空即主用户（安装向导设置的访问密码），兼容旧习惯。
+      if (!safeEqual(body.password || '', ACCESS_PASSWORD)) {
+        return json(res, 401, { error: '访问密码不正确' });
+      }
+      user = ADMIN_USER;
+      token = sessionToken('admin', passwordHash(ACCESS_PASSWORD));
+    } else {
+      const found = store.findUserByName(username);
+      if (!found || !safeEqual(userPasswordHash(username, body.password || ''), found.passwordHash)) {
+        return json(res, 401, { error: '用户名或密码不正确' });
+      }
+      user = { id: found.id, name: found.name, admin: false };
+      token = sessionToken(found.id, found.passwordHash);
     }
-    const token = passwordHash(ACCESS_PASSWORD);
     const cookie = `qqnas_auth=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${
       7 * 24 * 3600
     }`;
     res.setHeader('Set-Cookie', cookie);
-    return json(res, 200, { ok: true, token });
+    return json(res, 200, { ok: true, token, user });
   }
 
   if (url.pathname === '/api/logout' && method === 'POST') {
@@ -661,7 +714,8 @@ async function handleApi(req, res, url) {
     return json(res, 200, { ok: true });
   }
 
-  if (!isAuthed(req)) {
+  const user = resolveAuthUser(req);
+  if (!user) {
     return json(res, 401, { error: '需要登录', authRequired: true });
   }
 
@@ -684,11 +738,13 @@ async function handleApi(req, res, url) {
   if (url.pathname === '/api/bootstrap' && method === 'GET') {
     return json(res, 200, {
       settings: store.settings,
-      accounts: store.accounts.map(publicAccount),
+      // 飞牛用户间隔离：只返回当前登录用户自己的账号。
+      accounts: store.accounts.filter((account) => owns(user, account)).map(publicAccount),
       engine: runtimeSnapshot().status,
       runtime: runtimeSnapshot(),
       taskMeta: TASK_META,
       authRequired: Boolean(ACCESS_PASSWORD),
+      user: { id: user.id, name: user.name, admin: user.admin },
       version: APP_VERSION,
     });
   }
@@ -698,21 +754,85 @@ async function handleApi(req, res, url) {
   }
 
   if (url.pathname === '/api/settings' && method === 'PATCH') {
+    if (!user.admin) return json(res, 403, { error: '全局设置仅主用户可修改' });
     const body = await readBody(req);
     const settings = store.updateSettings(body);
     logger.info('已更新全局设置');
     return json(res, 200, { settings });
   }
 
+  /* 用户管理：仅主用户。普通用户由主用户创建，各自管理自己的 QQ 账号。 */
+
+  if (url.pathname === '/api/users' && method === 'GET') {
+    if (!user.admin) return json(res, 403, { error: '仅主用户可管理用户' });
+    return json(res, 200, {
+      users: store.users.map((u) => ({
+        id: u.id,
+        name: u.name,
+        createdAt: u.createdAt,
+        accounts: store.accounts.filter((a) => (a.owner || 'admin') === u.id).length,
+      })),
+    });
+  }
+
+  if (url.pathname === '/api/users' && method === 'POST') {
+    if (!user.admin) return json(res, 403, { error: '仅主用户可管理用户' });
+    const body = await readBody(req);
+    const name = String(body.name || '').trim();
+    if (!/^[\w一-龥-]{2,20}$/.test(name)) {
+      return json(res, 400, { error: '用户名需 2–20 位，可用中英文、数字、下划线' });
+    }
+    if (store.findUserByName(name)) return json(res, 400, { error: '用户名已存在' });
+    const password = String(body.password || '');
+    if (password.length < 6) return json(res, 400, { error: '密码至少 6 位' });
+    const created = store.addUser({
+      id: crypto.randomBytes(6).toString('hex'),
+      name,
+      passwordHash: userPasswordHash(name, password),
+      createdAt: Date.now(),
+    });
+    logger.info(`已创建用户：${name}`);
+    return json(res, 201, { user: { id: created.id, name: created.name, createdAt: created.createdAt } });
+  }
+
+  if (parts[1] === 'users' && parts[2]) {
+    if (!user.admin) return json(res, 403, { error: '仅主用户可管理用户' });
+    const target = store.findUser(parts[2]);
+    if (!target) return json(res, 404, { error: '用户不存在' });
+
+    if (parts.length === 3 && method === 'DELETE') {
+      const owned = store.accounts.filter((a) => (a.owner || 'admin') === target.id);
+      if (owned.length) {
+        return json(res, 400, { error: `该用户名下还有 ${owned.length} 个 QQ 账号，请先删除` });
+      }
+      store.removeUser(target.id);
+      logger.info(`已删除用户：${target.name}`);
+      return json(res, 200, { ok: true });
+    }
+
+    if (parts[3] === 'password' && method === 'POST') {
+      const body = await readBody(req);
+      const password = String(body.password || '');
+      if (password.length < 6) return json(res, 400, { error: '密码至少 6 位' });
+      target.passwordHash = userPasswordHash(target.name, password);
+      store.save();
+      logger.info(`已重置用户密码：${target.name}`);
+      return json(res, 200, { ok: true });
+    }
+
+    return json(res, 404, { error: '接口不存在' });
+  }
+
   if (url.pathname === '/api/accounts' && method === 'POST') {
     const body = await readBody(req);
-    const account = await createAccount({ alias: sanitizeAlias(body.alias) });
+    const account = await createAccount({ alias: sanitizeAlias(body.alias), owner: user.id });
     return json(res, 201, { account: publicAccount(account) });
   }
 
   if (parts[1] === 'accounts' && parts[2]) {
     const account = store.find(parts[2]);
-    if (!account) return json(res, 404, { error: '账号不存在' });
+    // 隔离：他人账号对当前用户不可见，统一按不存在处理，不泄露任何信息。
+    if (!account || !owns(user, account)) return json(res, 404, { error: '账号不存在' });
 
     if (parts.length === 3 && method === 'DELETE') {
       const purge = url.searchParams.get('purge') === '1';
@@ -938,7 +1058,17 @@ async function handleApi(req, res, url) {
   if (url.pathname === '/api/logs' && method === 'GET') {
     const after = Number(url.searchParams.get('after') || 0);
     const accountId = url.searchParams.get('accountId') || '';
-    return json(res, 200, { logs: logger.list({ after, accountId, limit: 400 }) });
+    if (accountId) {
+      const account = store.find(accountId);
+      if (!account || !owns(user, account)) return json(res, 404, { error: '账号不存在' });
+      return json(res, 200, { logs: logger.list({ after, accountId, limit: 400 }) });
+    }
+    // 全量日志按归属过滤：全局条目共享，账号条目只给归属人看。
+    const ownedIds = new Set(store.accounts.filter((a) => owns(user, a)).map((a) => a.id));
+    const logs = logger
+      .list({ after, accountId: '', limit: 400 })
+      .filter((entry) => !entry.accountId || ownedIds.has(entry.accountId));
+    return json(res, 200, { logs });
   }
 
   return json(res, 404, { error: '接口不存在' });
