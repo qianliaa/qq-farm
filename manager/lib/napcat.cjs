@@ -793,17 +793,20 @@ async function webuiLogin(account) {
   return credential;
 }
 
-async function webuiPost(account, pathName, body = {}) {
+async function webuiPost(account, pathName, body = {}, timeout = 8000) {
   const baseUrl = webuiBase(account);
   let credential = await webuiLogin(account);
-  let result = await webuiRequest(baseUrl, 'POST', pathName, body, credential);
+  let result = await webuiRequest(baseUrl, 'POST', pathName, body, credential, timeout);
   if (result && result.code !== 0 && /Unauthorized|token/i.test(result.message || '')) {
     credentialCache.delete(account.id);
     credential = await webuiLogin(account);
-    result = await webuiRequest(baseUrl, 'POST', pathName, body, credential);
+    result = await webuiRequest(baseUrl, 'POST', pathName, body, credential, timeout);
   }
   return result;
 }
+
+/** 二维码生成是阻塞式的：NapCat 要等 QQ 出图，启动初期可达几十秒，8 秒默认值等不到。 */
+const QRCODE_FETCH_TIMEOUT = 45000;
 
 async function getWebuiLoginState(account) {
   const status = await webuiPost(account, '/api/QQLogin/CheckLoginStatus');
@@ -813,7 +816,7 @@ async function getWebuiLoginState(account) {
   const data = status.data || {};
   let qrcode = data.qrcodeurl || '';
   if (!data.isLogin && !qrcode) {
-    const qr = await webuiPost(account, '/api/QQLogin/GetQQLoginQrcode');
+    const qr = await webuiPost(account, '/api/QQLogin/GetQQLoginQrcode', {}, QRCODE_FETCH_TIMEOUT);
     if (qr && qr.code === 0 && qr.data) qrcode = qr.data.qrcode || '';
   }
   let info = null;
@@ -836,7 +839,7 @@ async function getWebuiLoginState(account) {
 }
 
 async function refreshQrcode(account) {
-  const result = await webuiPost(account, '/api/QQLogin/RefreshQRcode');
+  const result = await webuiPost(account, '/api/QQLogin/RefreshQRcode', {}, QRCODE_FETCH_TIMEOUT);
   if (result && result.code === 0) {
     return (result.data && (result.data.qrcodeurl || result.data.qrcode)) || '';
   }

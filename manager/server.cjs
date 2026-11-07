@@ -13,7 +13,7 @@ const { Logger } = require('./lib/logger.cjs');
 const napcat = require('./lib/napcat.cjs');
 const { TaskEngine, TASK_KEYS, TASK_META } = require('./lib/tasks.cjs');
 
-const APP_VERSION = '2.0.11';
+const APP_VERSION = '2.0.12';
 const UPDATE_REPO = (process.env.QQNAS_UPDATE_REPO || 'qianliaa/qq-online').trim();
 const PORT = Number(process.env.PORT) || 8787;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -413,22 +413,35 @@ function applyWebuiLogin(account, webui) {
   store.save();
 }
 
-function refreshQrStateInBackground(account) {
-  const cached = qrcodeCache.get(account.id);
-  if (cached && cached.refreshing) return;
-  if (cached) cached.refreshing = true;
+/** 同一账号同一时刻只允许一个取码请求在飞，并发轮询共享同一个 Promise，不叠加压力。 */
+const qrInflight = new Map();
+
+function fetchQrStateOnce(account) {
+  let pending = qrInflight.get(account.id);
+  if (pending) return pending;
   const fetchedAt = Date.now();
-  napcat
+  pending = napcat
     .getWebuiLoginState(account)
     .then((webui) => {
       webui.fetchedAt = fetchedAt;
       cacheQrState(account.id, webui);
       applyWebuiLogin(account, webui);
+      return webui;
     })
-    .catch(() => {
+    .finally(() => {
+      if (qrInflight.get(account.id) === pending) qrInflight.delete(account.id);
       const entry = qrcodeCache.get(account.id);
       if (entry) entry.refreshing = false;
     });
+  qrInflight.set(account.id, pending);
+  return pending;
+}
+
+function refreshQrStateInBackground(account) {
+  const cached = qrcodeCache.get(account.id);
+  if (cached && cached.refreshing) return;
+  if (cached) cached.refreshing = true;
+  fetchQrStateOnce(account).catch(() => {});
 }
 
 async function probeAccount(account, { force = false } = {}) {
@@ -808,9 +821,12 @@ async function handleApi(req, res, url) {
             info: cached.info,
           });
         }
-        const webui = await napcat.getWebuiLoginState(account);
-        applyWebuiLogin(account, webui);
-        cacheQrState(account.id, webui);
+        // 已有取码请求在飞：不叠加，立即返回占位让前端继续显示「生成中」，
+        // 取码完成后写入缓存，下一轮轮询（3 秒）即可拿到。
+        if (qrInflight.has(account.id)) {
+          return json(res, 200, { ready: true, isLogin: false, qrcode: '', phase: 'generating', error: '' });
+        }
+        const webui = await fetchQrStateOnce(account);
         return json(res, 200, {
           ready: true,
           isLogin: webui.isLogin,

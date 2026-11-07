@@ -953,7 +953,7 @@ async function pollQr() {
   if (!state.qr.accountId || state.qr.done) return;
   const accountId = state.qr.accountId;
   try {
-    const data = await api(`/api/accounts/${accountId}/qr`);
+    const data = await api(`/api/accounts/${accountId}/qr`, { timeout: 50000 });
     if (state.qr.accountId !== accountId || state.qr.done) return;
     if (data.isLogin) {
       state.qr.done = true;
@@ -1022,7 +1022,7 @@ function renderQr(text) {
 async function refreshQr() {
   if (!state.qr.accountId) return;
   try {
-    await api(`/api/accounts/${state.qr.accountId}/qr`, { method: 'POST' });
+    await api(`/api/accounts/${state.qr.accountId}/qr`, { method: 'POST', timeout: 50000 });
     state.qr.current = '';
     toast('正在刷新二维码', 'info', 1400);
     await pollQr();
