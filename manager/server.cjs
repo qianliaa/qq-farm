@@ -13,7 +13,7 @@ const { Logger } = require('./lib/logger.cjs');
 const napcat = require('./lib/napcat.cjs');
 const { TaskEngine, TASK_KEYS, TASK_META } = require('./lib/tasks.cjs');
 
-const APP_VERSION = '2.0.8';
+const APP_VERSION = '2.0.9';
 const UPDATE_REPO = (process.env.QQNAS_UPDATE_REPO || 'qianliaa/qq-online').trim();
 const PORT = Number(process.env.PORT) || 8787;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -420,27 +420,26 @@ async function probeAccount(account, { force = false } = {}) {
       const client = engine.clientFor(account);
       const status = await client.getStatus();
       result.onebotReady = true;
-      if (status && status.online !== false) {
+      // get_status 的 online 可能是 null（查询不到）或踢下线后滞后误报，
+      // 只有明确为 true 且能取到登录信息才算在线，否则交给 WebUI 登录态复核。
+      let login = null;
+      try {
+        login = await client.getLoginInfo();
+      } catch (_e) {
+        login = null;
+      }
+      if (status && status.online === true && login && login.user_id) {
         result.online = true;
-        try {
-          const login = await client.getLoginInfo();
-          if (login) {
-            result.qq = login.user_id;
-            result.nickname = login.nickname;
-            store.recordOnline(account, login.user_id, login.nickname);
-            if (login.user_id) {
-              const key = `${account.id}:${login.user_id}`;
-              if (!CONFIG_STATE.has(key)) {
-                CONFIG_STATE.set(key, true);
-                const changed = napcat.ensureAccountOnebotConfig(account, login.user_id);
-                if (changed) logger.debug('已补写账号级 OneBot 配置', { accountId: account.id, account: account.alias });
-                account.configReadyFor = String(login.user_id);
-                store.save();
-              }
-            }
-          }
-        } catch (_e) {
-          /* 登录信息稍后重试 */
+        result.qq = login.user_id;
+        result.nickname = login.nickname;
+        store.recordOnline(account, login.user_id, login.nickname);
+        const key = `${account.id}:${login.user_id}`;
+        if (!CONFIG_STATE.has(key)) {
+          CONFIG_STATE.set(key, true);
+          const changed = napcat.ensureAccountOnebotConfig(account, login.user_id);
+          if (changed) logger.debug('已补写账号级 OneBot 配置', { accountId: account.id, account: account.alias });
+          account.configReadyFor = String(login.user_id);
+          store.save();
         }
       }
     } catch (_e) {
@@ -452,11 +451,15 @@ async function probeAccount(account, { force = false } = {}) {
     try {
       const webui = await napcat.getWebuiLoginState(account);
       if (webui.isLogin) {
+        // OneBot 状态不明确时，以 NapCat WebUI 的登录态为准。
         result.webuiLoggedIn = true;
+        result.online = true;
+        const uin = webui.info && (webui.info.uin || webui.info.user_id);
         if (webui.info) {
-          result.qq = webui.info.uin || webui.info.user_id || result.qq;
+          result.qq = uin || result.qq;
           result.nickname = webui.info.nickname || result.nickname;
         }
+        store.recordOnline(account, uin, result.nickname);
       }
     } catch (_e) {
       /* WebUI 未就绪 */

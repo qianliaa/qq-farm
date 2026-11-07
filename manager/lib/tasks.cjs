@@ -5,6 +5,11 @@ const napcat = require('./napcat.cjs');
 
 const TASK_KEYS = ['keepalive', 'dailyLike', 'groupSign', 'qzonePost', 'broadcast', 'randomActive', 'autoReply'];
 
+/** 进程启动后的保活宽限期：NapCat 初始化与自动重登期间只观察、不计失败。 */
+const STARTUP_GRACE_MS = 5 * 60 * 1000;
+/** 保活连续自动重启仍未恢复在线的最大次数，超过后暂停自动重启，避免重启循环加剧风控。 */
+const MAX_KEEPALIVE_RESTARTS = 3;
+
 const TASK_META = {
   keepalive: { name: '在线保活', desc: '保持电脑 QQ 在线，对应「电脑 QQ 在线 / 连续登录」加速项' },
   dailyLike: { name: '名片点赞', desc: '每天给群成员或好友点赞，维持互动' },
@@ -68,6 +73,7 @@ class TaskEngine {
     this.lastKeepalive = new Map();
     this.lastContainerSync = 0;
     this.keepaliveFails = new Map();
+    this.restartAttempts = new Map();
     this.replyCooldowns = new Map();
     this.attempts = new Map();
     this.ticking = false;
@@ -164,45 +170,109 @@ class TaskEngine {
     await this.withLock(account, 'keepalive', () => this.runKeepalive(account, task));
   }
 
-  async runKeepalive(account, task) {
-    const client = this.clientFor(account);
+  /**
+   * 探测账号真实在线状态。
+   * OneBot get_status 的 online 可能是 true / false / null（null 表示查询不到），
+   * 且 QQ 被踢下线后 NapCat 上报给 OneBot 的状态可能滞后，导致旧逻辑漏判。
+   * 因此以 NapCat WebUI 的 CheckLoginStatus（isLogin）为权威依据：
+   * WebUI 可达时以它为准，不可达时回退到 OneBot 的严格判定。
+   */
+  async probeOnline(account, client) {
+    let onebotOnline = false;
+    let onebotError = null;
+    let info = null;
     try {
       const status = await client.getStatus();
-      if (status && status.online === false) throw new Error('QQ 当前不在线');
-      let info = null;
       try {
         info = await client.getLoginInfo();
       } catch (_e) {
-        /* 忽略 */
+        info = null;
       }
+      onebotOnline = Boolean(status && status.online === true && info && info.user_id);
+    } catch (err) {
+      onebotError = err;
+    }
+
+    let webui = null;
+    try {
+      webui = await napcat.getWebuiLoginState(account);
+    } catch (_e) {
+      webui = null;
+    }
+
+    if (webui) {
+      if (!webui.isLogin) return { online: false, confirmed: true, source: 'webui' };
+      if (!info || !info.user_id) {
+        const uin = webui.info && (webui.info.uin || webui.info.user_id);
+        info = { user_id: uin, nickname: webui.info && (webui.info.nickname || webui.info.nick) };
+      }
+      return { online: true, info, source: onebotOnline ? 'onebot' : 'webui' };
+    }
+    if (onebotOnline) return { online: true, info, source: 'onebot' };
+    return { online: false, confirmed: false, error: onebotError, source: 'unreachable' };
+  }
+
+  async runKeepalive(account, task) {
+    const client = this.clientFor(account);
+    const probe = await this.probeOnline(account, client);
+
+    if (probe.online) {
       const wasOnline = account.stats.online;
-      this.store.recordOnline(account, info && info.user_id, info && info.nickname);
+      this.store.recordOnline(account, probe.info && probe.info.user_id, probe.info && probe.info.nickname);
       this.keepaliveFails.set(account.id, 0);
+      this.restartAttempts.set(account.id, 0);
       account.containerState = 'running';
       if (!wasOnline) {
-        this.logger.info(`账号已在线：${info && info.nickname ? info.nickname : account.qq || ''}`, this.meta(account));
+        this.logger.info(`账号已在线：${probe.info && probe.info.nickname ? probe.info.nickname : account.qq || ''}`, this.meta(account));
       }
       return { ok: true, message: '在线' };
-    } catch (err) {
-      const fails = (this.keepaliveFails.get(account.id) || 0) + 1;
-      this.keepaliveFails.set(account.id, fails);
-      if (fails === 1) {
-        this.logger.warn(`保活探测失败：${err.message}`, this.meta(account));
-      }
-      if (fails >= Math.max(1, Number(task.failThreshold) || 2) && task.autoRestart) {
-        this.keepaliveFails.set(account.id, 0);
-        this.store.recordOffline(account);
-        this.logger.warn('连续探测失败，正在重启 NapCat', this.meta(account));
-        try {
-          await napcat.restartAccount(account);
-          this.lastKeepalive.set(account.id, Date.now() + 30000);
-          return { ok: false, message: '探测失败，已重启 NapCat' };
-        } catch (e) {
-          this.logger.error(`重启 NapCat 失败：${e.message}`, this.meta(account));
-          return { ok: false, message: `探测失败，重启也失败：${e.message}` };
-        }
-      }
-      return { ok: false, message: err.message };
+    }
+
+    // 进程刚启动，NapCat 还在初始化或自动重登，宽限期内只观察不计失败。
+    const startedAt = Number(account.startedAt) || 0;
+    if (startedAt && Date.now() - startedAt < STARTUP_GRACE_MS) {
+      return { ok: false, message: '启动宽限期内，暂不判定' };
+    }
+
+    const reason = probe.confirmed
+      ? 'QQ 当前不在线'
+      : `OneBot 与 WebUI 均无响应${probe.error ? `：${probe.error.message}` : ''}`;
+    // 已确认离线时立刻标记，面板第一时间显示离线；接口异常则等达到阈值再标记。
+    if (probe.confirmed) this.store.recordOffline(account);
+    const fails = (this.keepaliveFails.get(account.id) || 0) + 1;
+    this.keepaliveFails.set(account.id, fails);
+    if (fails === 1) {
+      this.logger.warn(`保活探测失败：${reason}`, this.meta(account));
+    }
+    if (fails < Math.max(1, Number(task.failThreshold) || 2) || !task.autoRestart) {
+      return { ok: false, message: reason };
+    }
+    this.keepaliveFails.set(account.id, 0);
+    this.store.recordOffline(account);
+
+    // 未完成首次登录的账号没有会话可恢复，重启只会打断正在进行的扫码登录。
+    if (!account.qq) {
+      this.logger.warn('账号尚未完成首次登录，跳过自动重启，等待扫码', this.meta(account));
+      return { ok: false, message: '账号未登录，等待扫码' };
+    }
+    // 重启退避：连续多次重启仍不在线，说明会话无法自愈（多为风控或需重扫码），
+    // 继续重启只会加剧风控，暂停自动重启并提示人工处理。
+    const attempts = (this.restartAttempts.get(account.id) || 0) + 1;
+    this.restartAttempts.set(account.id, attempts);
+    if (attempts > MAX_KEEPALIVE_RESTARTS) {
+      account.lastError = '连续重启后仍未恢复在线，可能需要重新扫码或账号被风控';
+      this.store.save();
+      this.logger.warn('连续重启仍未恢复在线，已暂停自动重启，请检查账号状态', this.meta(account));
+      return { ok: false, message: '连续重启未恢复，已暂停自动重启' };
+    }
+    this.logger.warn(`连续探测失败，正在重启 NapCat（第 ${attempts}/${MAX_KEEPALIVE_RESTARTS} 次）`, this.meta(account));
+    try {
+      await napcat.restartAccount(account);
+      this.lastKeepalive.set(account.id, Date.now() + 30000);
+      return { ok: false, message: '探测失败，已重启 NapCat' };
+    } catch (e) {
+      this.logger.error(`重启 NapCat 失败：${e.message}`, this.meta(account));
+      return { ok: false, message: `探测失败，重启也失败：${e.message}` };
     }
   }
 
