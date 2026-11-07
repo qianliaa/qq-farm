@@ -5,6 +5,9 @@ data/
 .tmp-fpk-check*/
 fnos-fpk/.build/
 
+# 本地凭证
+.gh-token*
+
 # 构建产物（历史版本不跟踪，当前版本随仓库提供直接下载）
 fnos-fpk/dist/*
 !fnos-fpk/dist/qqnas_2.0.6_all.fpk
