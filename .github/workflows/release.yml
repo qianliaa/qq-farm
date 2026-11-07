@@ -1,0 +1,70 @@
+name: Build and Release fpk
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build fpk
+        run: python3 fnos-fpk/build-fpk.py
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version[[:space:]]*=[[:space:]]*//p' fnos-fpk/fpk-src/manifest | head -n1 | tr -d '\r')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          fi
+          test -f "fnos-fpk/dist/qqnas_${version}_all.fpk"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          file="fnos-fpk/dist/qqnas_${VERSION}_all.fpk"
+          sha=$(sha256sum "$file" | cut -d' ' -f1)
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            {
+              echo "## QQ 挂机仓 ${VERSION}"
+              echo
+              echo "- 使用飞牛原生 Node.js 22 运行时，不依赖 Docker"
+              echo "- 安装包见下方 Assets 中的 \`$(basename "$file")\`"
+              echo
+              echo "构建提交：${GITHUB_SHA}"
+              echo
+              echo "SHA-256：\`${sha}\`"
+            } > /tmp/release-notes.md
+            gh release create "$TAG" --title "QQ 挂机仓 ${VERSION}" --notes-file /tmp/release-notes.md
+          fi
+          gh release upload "$TAG" "$file" --clobber
