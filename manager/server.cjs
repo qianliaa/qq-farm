@@ -13,7 +13,7 @@ const { Logger } = require('./lib/logger.cjs');
 const napcat = require('./lib/napcat.cjs');
 const { TaskEngine, TASK_KEYS, TASK_META } = require('./lib/tasks.cjs');
 
-const APP_VERSION = '2.0.14';
+const APP_VERSION = '2.0.15';
 const UPDATE_REPO = (process.env.QQNAS_UPDATE_REPO || 'qianliaa/qq-online').trim();
 const PORT = Number(process.env.PORT) || 8787;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -39,7 +39,26 @@ const MANAGER_INTERNAL_URL =
 
 const store = new Store();
 const logger = new Logger({ dir: path.join(DATA_DIR, 'logs'), limit: store.settings.logLimit });
-const engine = new TaskEngine({ store, logger, managerInternalUrl: MANAGER_INTERNAL_URL });
+const notifyChannel = require('./lib/notify.cjs');
+
+/** 保活触发的用户通知：按账号归属人读取其通知配置。 */
+async function dispatchNotify(account, kind) {
+  const cfg = store.getNotify(account.owner || 'admin');
+  if (!cfg || !cfg.type || !cfg.target) return;
+  if (kind === 'offline' && cfg.offline === false) return;
+  if (kind === 'online' && !cfg.online) return;
+  const name = account.alias || account.qq || account.id;
+  const time = new Date().toLocaleString('zh-CN', { hour12: false });
+  const offline = kind === 'offline';
+  const title = offline ? '【QQ挂机仓】账号掉线提醒' : '【QQ挂机仓】账号已恢复在线';
+  const text = offline
+    ? `账号「${name}」${account.qq ? `（QQ ${account.qq}）` : ''}已确认离线，请打开面板查看，必要时重新扫码。\n时间：${time}`
+    : `账号「${name}」${account.qq ? `（QQ ${account.qq}）` : ''}已恢复在线。\n时间：${time}`;
+  await notifyChannel.send(cfg, title, text);
+  logger.info(`已发送${offline ? '掉线' : '恢复'}通知`, { accountId: account.id, account: name });
+}
+
+const engine = new TaskEngine({ store, logger, managerInternalUrl: MANAGER_INTERNAL_URL, notify: dispatchNotify });
 
 const runtime = {
   startedAt: Date.now(),
@@ -222,12 +241,13 @@ function requestToken(req) {
 }
 
 function resolveAuthUser(req) {
-  if (!ACCESS_PASSWORD) return ADMIN_USER;
+  // 无访问密码模式：仍需用户名身份做隔离（令牌种子固定，重启不失效）。
+  const seed = ACCESS_PASSWORD ? null : 'nopassword';
   const actual = requestToken(req);
   if (!actual) return null;
-  if (safeEqual(actual, sessionToken('admin', passwordHash(ACCESS_PASSWORD)))) return ADMIN_USER;
+  if (safeEqual(actual, sessionToken('admin', seed || passwordHash(ACCESS_PASSWORD)))) return ADMIN_USER;
   for (const user of store.users) {
-    if (safeEqual(actual, sessionToken(user.id, user.passwordHash))) {
+    if (safeEqual(actual, sessionToken(user.id, seed || user.passwordHash))) {
       return { id: user.id, name: user.name, admin: false };
     }
   }
@@ -683,11 +703,35 @@ async function handleApi(req, res, url) {
 
   if (url.pathname === '/api/login' && method === 'POST') {
     const body = await readBody(req);
-    if (!ACCESS_PASSWORD) return json(res, 200, { ok: true, user: ADMIN_USER });
     const username = String(body.username || '').trim();
     let user = null;
     let token = '';
-    if (!username) {
+    if (!ACCESS_PASSWORD) {
+      // 无访问密码模式：用户名即身份（留空为主用户），首次使用自动建档，实现无密码用户隔离。
+      if (!username) {
+        user = ADMIN_USER;
+        token = sessionToken('admin', 'nopassword');
+      } else {
+        if (!/^[\w一-龥-]{2,20}$/.test(username)) {
+          return json(res, 400, { error: '用户名需 2–20 位，可用中英文、数字、下划线' });
+        }
+        let found = store.findUserByName(username);
+        if (found && found.passwordHash) {
+          return json(res, 401, { error: '该用户已设置密码，请先在安装向导中设置访问密码' });
+        }
+        if (!found) {
+          found = store.addUser({
+            id: crypto.randomBytes(6).toString('hex'),
+            name: username,
+            passwordHash: '',
+            createdAt: Date.now(),
+          });
+          logger.info(`无密码模式：已自动建档用户「${username}」`);
+        }
+        user = { id: found.id, name: found.name, admin: false };
+        token = sessionToken(found.id, 'nopassword');
+      }
+    } else if (!username) {
       // 用户名留空即主用户（安装向导设置的访问密码），兼容旧习惯。
       if (!safeEqual(body.password || '', ACCESS_PASSWORD)) {
         return json(res, 401, { error: '访问密码不正确' });
@@ -696,11 +740,15 @@ async function handleApi(req, res, url) {
       token = sessionToken('admin', passwordHash(ACCESS_PASSWORD));
     } else {
       const found = store.findUserByName(username);
-      if (!found || !safeEqual(userPasswordHash(username, body.password || ''), found.passwordHash)) {
+      // 无密码建档的用户只接受空密码登录
+      const passwordOk = found && (found.passwordHash === ''
+        ? !body.password
+        : safeEqual(userPasswordHash(username, body.password || ''), found.passwordHash));
+      if (!passwordOk) {
         return json(res, 401, { error: '用户名或密码不正确' });
       }
       user = { id: found.id, name: found.name, admin: false };
-      token = sessionToken(found.id, found.passwordHash);
+      token = sessionToken(found.id, found.passwordHash || 'nopassword');
     }
     const cookie = `qqnas_auth=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${
       7 * 24 * 3600
@@ -761,6 +809,48 @@ async function handleApi(req, res, url) {
     return json(res, 200, { settings });
   }
 
+  /* 通知设置：每个用户配置自己的掉线/恢复通知（企业微信/钉钉/飞书/Server酱/Bark）。 */
+
+  if (url.pathname === '/api/notify' && method === 'GET') {
+    const cfg = store.getNotify(user.id) || {};
+    return json(res, 200, {
+      notify: {
+        type: cfg.type || '',
+        target: cfg.target || '',
+        offline: cfg.offline !== false,
+        online: Boolean(cfg.online),
+      },
+      channels: notifyChannel.CHANNELS,
+    });
+  }
+
+  if (url.pathname === '/api/notify' && method === 'PUT') {
+    const body = await readBody(req);
+    const type = String(body.type || '').trim();
+    if (type && !notifyChannel.CHANNELS[type]) return json(res, 400, { error: '未知通知渠道' });
+    const cfg = {
+      type,
+      target: String(body.target || '').trim(),
+      offline: body.offline !== false,
+      online: Boolean(body.online),
+    };
+    if (cfg.type && !cfg.target) return json(res, 400, { error: '请填写 Webhook 地址或 Key' });
+    store.setNotify(user.id, cfg);
+    logger.info('已更新通知设置');
+    return json(res, 200, { notify: cfg });
+  }
+
+  if (url.pathname === '/api/notify/test' && method === 'POST') {
+    const cfg = store.getNotify(user.id);
+    if (!cfg || !cfg.type || !cfg.target) return json(res, 400, { error: '请先保存通知设置' });
+    try {
+      await notifyChannel.send(cfg, '【QQ挂机仓】测试通知', '通知渠道配置成功，账号掉线/恢复提醒将推送到这里。');
+      return json(res, 200, { ok: true });
+    } catch (err) {
+      return json(res, 400, { error: `发送失败：${err.message}` });
+    }
+  }
+
   /* 用户管理：仅主用户。普通用户由主用户创建，各自管理自己的 QQ 账号。 */
 
   if (url.pathname === '/api/users' && method === 'GET') {
@@ -784,11 +874,12 @@ async function handleApi(req, res, url) {
     }
     if (store.findUserByName(name)) return json(res, 400, { error: '用户名已存在' });
     const password = String(body.password || '');
-    if (password.length < 6) return json(res, 400, { error: '密码至少 6 位' });
+    // 无访问密码模式：允许创建无密码用户（用户名即身份）
+    if (ACCESS_PASSWORD && password.length < 6) return json(res, 400, { error: '密码至少 6 位' });
     const created = store.addUser({
       id: crypto.randomBytes(6).toString('hex'),
       name,
-      passwordHash: userPasswordHash(name, password),
+      passwordHash: password ? userPasswordHash(name, password) : '',
       createdAt: Date.now(),
     });
     logger.info(`已创建用户：${name}`);

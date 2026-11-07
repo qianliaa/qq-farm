@@ -237,8 +237,13 @@ function showAuth() {
       resolve(ok);
     };
   });
+  // 无访问密码模式：只输用户名（留空为主用户），用用户名做数据隔离。
+  const passwordField = $('#authPassword').closest('.field');
+  if (passwordField) passwordField.classList.toggle('hidden', !state.authRequired);
+  const subtitle = $('#authModal .modal-subtitle');
+  if (subtitle && !state.authRequired) subtitle.textContent = '输入你的用户名进入自己的账号空间，留空为主用户';
   openModal('authModal');
-  setTimeout(() => $('#authPassword').focus(), 60);
+  setTimeout(() => $(state.authRequired ? '#authPassword' : '#authUsername').focus(), 60);
   return new Promise((resolve) => {
     state.authResolver = resolve;
   });
@@ -1242,6 +1247,53 @@ function fillSettings() {
   const saveBtn = $('#btnSaveSettings');
   if (saveBtn) saveBtn.classList.toggle('hidden', !isAdmin);
   if (isAdmin) loadUsers();
+  loadNotify();
+}
+
+/* ------------------------------- 通知设置 ------------------------------- */
+
+async function loadNotify() {
+  try {
+    const data = await api('/api/notify');
+    const cfg = data.notify || {};
+    if ($('#notifyType')) $('#notifyType').value = cfg.type || '';
+    if ($('#notifyTarget')) $('#notifyTarget').value = cfg.target || '';
+    if ($('#notifyOffline')) $('#notifyOffline').checked = cfg.offline !== false;
+    if ($('#notifyOnline')) $('#notifyOnline').checked = Boolean(cfg.online);
+  } catch (_e) {
+    /* 通知设置加载失败不影响其他设置 */
+  }
+}
+
+async function saveNotify({ silent = false } = {}) {
+  const body = {
+    type: $('#notifyType').value,
+    target: $('#notifyTarget').value.trim(),
+    offline: $('#notifyOffline').checked,
+    online: $('#notifyOnline').checked,
+  };
+  try {
+    await api('/api/notify', { method: 'PUT', body: JSON.stringify(body) });
+    if (!silent) toast('通知设置已保存', 'success');
+    return true;
+  } catch (error) {
+    toast(`保存失败：${error.message}`, 'error');
+    return false;
+  }
+}
+
+async function testNotify() {
+  if (!(await saveNotify({ silent: true }))) return;
+  const button = $('#btnTestNotify');
+  button.disabled = true;
+  try {
+    await api('/api/notify/test', { method: 'POST' });
+    toast('测试通知已发送，请查收', 'success');
+  } catch (error) {
+    toast(`测试失败：${error.message}`, 'error');
+  } finally {
+    button.disabled = false;
+  }
 }
 
 /* ------------------------------- 用户管理 ------------------------------- */
@@ -1413,6 +1465,8 @@ function bindEvents() {
     });
   }
   if ($('#btnAddUser')) $('#btnAddUser').addEventListener('click', addUser);
+  if ($('#btnSaveNotify')) $('#btnSaveNotify').addEventListener('click', () => saveNotify());
+  if ($('#btnTestNotify')) $('#btnTestNotify').addEventListener('click', testNotify);
   if ($('#userList')) {
     $('#userList').addEventListener('click', (event) => {
       const btn = event.target.closest('button');
@@ -1624,7 +1678,8 @@ async function init() {
   try {
     const session = await rawApi('/api/session', { timeout: 10000 });
     state.authRequired = Boolean(session.authRequired);
-    if (session.authRequired && !session.authed) await showAuth();
+    // 有密码要登录；无密码也要先选个用户名（用户隔离），已登录则跳过。
+    if (!session.authed) await showAuth();
   } catch (_e) {
     /* 会话接口异常时仍然继续尝试加载，下面会给出明确提示 */
   }

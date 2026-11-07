@@ -304,6 +304,27 @@
             <a class="ghost-btn small hidden" id="btnOpenRelease" target="_blank" rel="noopener">查看新版本</a>
           </div>
         </div>
+        <div class="field span-2">
+          <span>通知设置（掉线/恢复提醒，仅作用于你的账号）</span>
+          <small>支持企业微信、钉钉、飞书群机器人 Webhook，以及 Server酱、Bark。</small>
+          <div class="runtime-setting-actions">
+            <select id="notifyType" style="flex:1;min-width:0">
+              <option value="">不启用通知</option>
+              <option value="wecom">企业微信</option>
+              <option value="dingtalk">钉钉</option>
+              <option value="feishu">飞书</option>
+              <option value="serverchan">Server酱</option>
+              <option value="bark">Bark</option>
+            </select>
+            <input id="notifyTarget" type="text" placeholder="Webhook 地址或 Key" style="flex:2;min-width:0">
+          </div>
+          <div class="runtime-setting-actions" style="align-items:center">
+            <label style="display:flex;align-items:center;gap:4px"><input id="notifyOffline" type="checkbox" checked> 掉线通知</label>
+            <label style="display:flex;align-items:center;gap:4px"><input id="notifyOnline" type="checkbox"> 恢复通知</label>
+            <button class="ghost-btn small" id="btnSaveNotify">保存</button>
+            <button class="ghost-btn small" id="btnTestNotify">发送测试</button>
+          </div>
+        </div>
         <div class="field span-2" id="userManageBox">
           <span>用户管理（飞牛用户间隔离）</span>
           <small>每个用户只看到并管理自己的 QQ 账号；把用户名和初始密码告诉对应的飞牛用户即可。</small>

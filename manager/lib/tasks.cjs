@@ -66,10 +66,11 @@ function sleep(ms) {
 }
 
 class TaskEngine {
-  constructor({ store, logger, managerInternalUrl }) {
+  constructor({ store, logger, managerInternalUrl, notify = null }) {
     this.store = store;
     this.logger = logger;
     this.managerInternalUrl = managerInternalUrl;
+    this.notify = notify;
     this.timer = null;
     this.locks = new Map();
     this.lastKeepalive = new Map();
@@ -79,6 +80,21 @@ class TaskEngine {
     this.replyCooldowns = new Map();
     this.attempts = new Map();
     this.ticking = false;
+    // 已发送掉线通知的账号：恢复在线时补发恢复通知；同一账号掉线通知 30 分钟内不重复。
+    this.offlineNotified = new Map();
+  }
+
+  /** 触发用户通知（异步不阻塞保活）；kind: 'offline' | 'online'。 */
+  fireNotify(account, kind) {
+    if (typeof this.notify !== 'function') return;
+    if (kind === 'offline') {
+      const last = this.offlineNotified.get(account.id) || 0;
+      if (Date.now() - last < 30 * 60 * 1000) return;
+      this.offlineNotified.set(account.id, Date.now());
+    }
+    Promise.resolve()
+      .then(() => this.notify(account, kind))
+      .catch((err) => this.logger.warn(`通知发送失败：${err.message}`, this.meta(account)));
   }
 
   clientFor(account) {
@@ -226,6 +242,11 @@ class TaskEngine {
       account.containerState = 'running';
       if (!wasOnline) {
         this.logger.info(`账号已在线：${probe.info && probe.info.nickname ? probe.info.nickname : account.qq || ''}`, this.meta(account));
+        // 掉线通知后恢复在线：补一条恢复通知。
+        if (this.offlineNotified && this.offlineNotified.has(account.id)) {
+          this.offlineNotified.delete(account.id);
+          this.fireNotify(account, 'online');
+        }
       }
       return { ok: true, message: '在线' };
     }
@@ -240,7 +261,10 @@ class TaskEngine {
       ? 'QQ 当前不在线'
       : `OneBot 与 WebUI 均无响应${probe.error ? `：${probe.error.message}` : ''}`;
     // 已确认离线时立刻标记，面板第一时间显示离线；接口异常则等达到阈值再标记。
-    if (probe.confirmed) this.store.recordOffline(account);
+    if (probe.confirmed) {
+      this.store.recordOffline(account);
+      this.fireNotify(account, 'offline');
+    }
     const fails = (this.keepaliveFails.get(account.id) || 0) + 1;
     this.keepaliveFails.set(account.id, fails);
     if (fails === 1) {

@@ -112,6 +112,7 @@ class Store {
       settings: clone(DEFAULT_SETTINGS),
       accounts: [],
       users: [],
+      notify: {},
     };
     this.saveTimer = null;
     this.load();
@@ -130,6 +131,7 @@ class Store {
         settings: { ...DEFAULT_SETTINGS, ...(raw.settings || {}) },
         accounts: Array.isArray(raw.accounts) ? raw.accounts : [],
         users: Array.isArray(raw.users) ? raw.users : [],
+        notify: raw.notify && typeof raw.notify === 'object' ? raw.notify : {},
       };
       for (const account of this.data.accounts) {
         account.tasks = { ...defaultTasks(), ...(account.tasks || {}) };
@@ -220,8 +222,22 @@ class Store {
     const index = this.data.users.findIndex((u) => u.id === id);
     if (index < 0) return null;
     const [removed] = this.data.users.splice(index, 1);
+    // 顺手清理该用户的通知配置
+    if (this.data.notify && this.data.notify[id]) delete this.data.notify[id];
     this.saveNow();
     return removed;
+  }
+
+  /* 通知配置：按用户隔离，各自配置自己的掉线/恢复通知。 */
+
+  getNotify(userId) {
+    return (this.data.notify && this.data.notify[userId]) || null;
+  }
+
+  setNotify(userId, config) {
+    this.data.notify[userId] = config;
+    this.saveNow();
+    return config;
   }
 
   recordOnline(account, userId, nickname) {
