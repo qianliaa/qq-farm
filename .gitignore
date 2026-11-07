@@ -5,8 +5,9 @@ data/
 .tmp-fpk-check*/
 fnos-fpk/.build/
 
-# 构建产物（安装包随 GitHub Releases 发布）
-fnos-fpk/dist/
+# 构建产物（历史版本不跟踪，当前版本随仓库提供直接下载）
+fnos-fpk/dist/*
+!fnos-fpk/dist/qqnas_2.0.6_all.fpk
 
 # 2.0.0 起改用飞牛原生运行时，以下旧 Docker 文件不再参与构建
 docker-compose.yml
