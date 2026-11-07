@@ -13,7 +13,7 @@ const { Logger } = require('./lib/logger.cjs');
 const napcat = require('./lib/napcat.cjs');
 const { TaskEngine, TASK_KEYS, TASK_META } = require('./lib/tasks.cjs');
 
-const APP_VERSION = '2.0.10';
+const APP_VERSION = '2.0.11';
 const UPDATE_REPO = (process.env.QQNAS_UPDATE_REPO || 'qianliaa/qq-online').trim();
 const PORT = Number(process.env.PORT) || 8787;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -375,6 +375,62 @@ const statusCache = new Map();
 const CONFIG_STATE = new Map();
 const starting = new Set();
 
+/**
+ * 二维码缓存：NapCat 生成二维码是阻塞式的（要等 QQ 出图，常达数秒甚至
+ * 超过接口超时），而登录弹窗每 3 秒轮询一次，逐个等待就会一直转圈。
+ * 这里缓存最近的登录状态毫秒级返回，超过 15 秒后台异步刷新，
+ * 5 分钟内的旧码先展示再静默换新，弹窗秒开、二维码自动接力。
+ */
+const QRCODE_REFRESH_AFTER = 15 * 1000;
+const QRCODE_STALE_MAX = 5 * 60 * 1000;
+const qrcodeCache = new Map();
+
+function cacheQrState(accountId, webui) {
+  const existing = qrcodeCache.get(accountId);
+  // 后台刷新可能晚于更新的请求返回，旧结果不覆盖新结果。
+  if (existing && existing.freshAt && existing.freshAt > (webui.fetchedAt || 0)) return;
+  qrcodeCache.set(accountId, {
+    qrcode: webui.qrcode || '',
+    isLogin: Boolean(webui.isLogin),
+    isOffline: Boolean(webui.isOffline),
+    phase: webui.phase || '',
+    error: webui.error || '',
+    info: webui.info || null,
+    at: Date.now(),
+    freshAt: webui.fetchedAt || Date.now(),
+    refreshing: false,
+  });
+}
+
+function applyWebuiLogin(account, webui) {
+  if (!webui.isLogin || !webui.info) return;
+  const uin = webui.info.uin || webui.info.user_id;
+  if (!uin) return;
+  account.qq = String(uin);
+  account.nickname = webui.info.nickname || webui.info.nick || account.nickname;
+  account.stats.lastLoginAt = Date.now();
+  napcat.ensureAccountOnebotConfig(account, account.qq);
+  store.save();
+}
+
+function refreshQrStateInBackground(account) {
+  const cached = qrcodeCache.get(account.id);
+  if (cached && cached.refreshing) return;
+  if (cached) cached.refreshing = true;
+  const fetchedAt = Date.now();
+  napcat
+    .getWebuiLoginState(account)
+    .then((webui) => {
+      webui.fetchedAt = fetchedAt;
+      cacheQrState(account.id, webui);
+      applyWebuiLogin(account, webui);
+    })
+    .catch(() => {
+      const entry = qrcodeCache.get(account.id);
+      if (entry) entry.refreshing = false;
+    });
+}
+
 async function probeAccount(account, { force = false } = {}) {
   const cached = statusCache.get(account.id);
   if (!force && cached && Date.now() - cached.at < 4000) return cached.value;
@@ -685,6 +741,7 @@ async function handleApi(req, res, url) {
       if (MOCK) account.containerState = action === 'stop' ? 'exited' : 'running';
       store.save();
       statusCache.delete(account.id);
+      qrcodeCache.delete(account.id); // 启停/重启/重建后旧二维码作废
       logger.info(`账号操作：${action}`, { accountId: account.id, account: account.alias });
       return json(res, 200, { ok: true, account: publicAccount(account) });
     }
@@ -737,17 +794,23 @@ async function handleApi(req, res, url) {
         });
       }
       try {
-        const webui = await napcat.getWebuiLoginState(account);
-        if (webui.isLogin && webui.info) {
-          const uin = webui.info.uin || webui.info.user_id;
-          if (uin) {
-            account.qq = String(uin);
-            account.nickname = webui.info.nickname || webui.info.nick || account.nickname;
-            account.stats.lastLoginAt = Date.now();
-            napcat.ensureAccountOnebotConfig(account, account.qq);
-            store.save();
-          }
+        // 缓存可用：毫秒级返回，超过 15 秒顺手后台刷新，弹窗不再转圈等码。
+        const cached = qrcodeCache.get(account.id);
+        if (cached && !cached.isLogin && cached.qrcode && Date.now() - cached.at < QRCODE_STALE_MAX) {
+          if (Date.now() - cached.at > QRCODE_REFRESH_AFTER) refreshQrStateInBackground(account);
+          return json(res, 200, {
+            ready: true,
+            isLogin: false,
+            isOffline: cached.isOffline,
+            qrcode: cached.qrcode,
+            phase: cached.phase,
+            error: cached.error,
+            info: cached.info,
+          });
         }
+        const webui = await napcat.getWebuiLoginState(account);
+        applyWebuiLogin(account, webui);
+        cacheQrState(account.id, webui);
         return json(res, 200, {
           ready: true,
           isLogin: webui.isLogin,
@@ -758,6 +821,20 @@ async function handleApi(req, res, url) {
           info: webui.info,
         });
       } catch (err) {
+        // 接口异常时若有旧码先展示，同时后台重试，避免弹窗反复转圈。
+        const cached = qrcodeCache.get(account.id);
+        if (cached && !cached.isLogin && cached.qrcode) {
+          refreshQrStateInBackground(account);
+          return json(res, 200, {
+            ready: true,
+            isLogin: false,
+            isOffline: cached.isOffline,
+            qrcode: cached.qrcode,
+            phase: cached.phase,
+            error: cached.error,
+            info: cached.info,
+          });
+        }
         return json(res, 200, { ready: false, error: err.message, isLogin: false, qrcode: '' });
       }
     }
@@ -766,6 +843,9 @@ async function handleApi(req, res, url) {
       if (MOCK) return json(res, 200, { ok: true });
       try {
         const qrcode = await napcat.refreshQrcode(account);
+        // 主动刷新后旧缓存作废；拿到新码就直接入缓存，下次轮询秒回。
+        qrcodeCache.delete(account.id);
+        if (qrcode) cacheQrState(account.id, { qrcode, isLogin: false });
         return json(res, 200, { ok: true, qrcode });
       } catch (err) {
         return json(res, 500, { error: err.message });
