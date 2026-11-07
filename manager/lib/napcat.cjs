@@ -818,6 +818,14 @@ async function getWebuiLoginState(account) {
   if (!data.isLogin && !qrcode) {
     const qr = await webuiPost(account, '/api/QQLogin/GetQQLoginQrcode', {}, QRCODE_FETCH_TIMEOUT);
     if (qr && qr.code === 0 && qr.data) qrcode = qr.data.qrcode || '';
+    // 被踢下线的账号内核常卡在旧票据快速重登循环里，不进扫码阶段，
+    // 被动取码一直为空；主动 Refresh 强制切回扫码阶段出码。
+    if (!qrcode) {
+      const refreshed = await webuiPost(account, '/api/QQLogin/RefreshQRcode', {}, QRCODE_FETCH_TIMEOUT);
+      if (refreshed && refreshed.code === 0 && refreshed.data) {
+        qrcode = refreshed.data.qrcodeurl || refreshed.data.qrcode || '';
+      }
+    }
   }
   let info = null;
   if (data.isLogin) {

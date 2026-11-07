@@ -13,7 +13,7 @@ const { Logger } = require('./lib/logger.cjs');
 const napcat = require('./lib/napcat.cjs');
 const { TaskEngine, TASK_KEYS, TASK_META } = require('./lib/tasks.cjs');
 
-const APP_VERSION = '2.0.12';
+const APP_VERSION = '2.0.13';
 const UPDATE_REPO = (process.env.QQNAS_UPDATE_REPO || 'qianliaa/qq-online').trim();
 const PORT = Number(process.env.PORT) || 8787;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -441,7 +441,20 @@ function refreshQrStateInBackground(account) {
   const cached = qrcodeCache.get(account.id);
   if (cached && cached.refreshing) return;
   if (cached) cached.refreshing = true;
-  fetchQrStateOnce(account).catch(() => {});
+  fetchQrStateOnce(account).catch((err) => {
+    // 失败也写入缓存，轮询能把错误带出来，而不是永远显示「生成中」。
+    qrcodeCache.set(account.id, {
+      qrcode: '',
+      isLogin: false,
+      isOffline: false,
+      phase: '',
+      error: (err && err.message) || '取码失败',
+      info: null,
+      at: Date.now(),
+      freshAt: Date.now(),
+      refreshing: false,
+    });
+  });
 }
 
 async function probeAccount(account, { force = false } = {}) {
@@ -807,8 +820,23 @@ async function handleApi(req, res, url) {
         });
       }
       try {
-        // 缓存可用：毫秒级返回，超过 15 秒顺手后台刷新，弹窗不再转圈等码。
+        // 扫码窗口：用户正在弹窗里扫码，保活在此期间不重启进程，
+        // 否则重启会作废刚生成的二维码、打断扫码登录。
+        account.qrSessionAt = Date.now();
         const cached = qrcodeCache.get(account.id);
+        // 已登录：缓存很新才可信（掉线后旧登录态不能当真），否则后台复核。
+        if (cached && cached.isLogin && Date.now() - cached.at < QRCODE_REFRESH_AFTER) {
+          return json(res, 200, {
+            ready: true,
+            isLogin: true,
+            isOffline: cached.isOffline,
+            qrcode: '',
+            phase: cached.phase,
+            error: '',
+            info: cached.info,
+          });
+        }
+        // 缓存有码：毫秒级返回，超过 15 秒顺手后台刷新，弹窗不再转圈等码。
         if (cached && !cached.isLogin && cached.qrcode && Date.now() - cached.at < QRCODE_STALE_MAX) {
           if (Date.now() - cached.at > QRCODE_REFRESH_AFTER) refreshQrStateInBackground(account);
           return json(res, 200, {
@@ -821,20 +849,19 @@ async function handleApi(req, res, url) {
             info: cached.info,
           });
         }
-        // 已有取码请求在飞：不叠加，立即返回占位让前端继续显示「生成中」，
-        // 取码完成后写入缓存，下一轮轮询（3 秒）即可拿到。
-        if (qrInflight.has(account.id)) {
-          return json(res, 200, { ready: true, isLogin: false, qrcode: '', phase: 'generating', error: '' });
+        // 无码可用：后台取码（被踢账号会自动强制刷新出码），立即返回占位，
+        // 接口永不阻塞，取码完成后写入缓存，下一轮轮询（3 秒）即可拿到。
+        refreshQrStateInBackground(account);
+        // 最近一次取码失败：把错误透传给前端展示，15 秒后回到「生成中」继续重试。
+        if (cached && cached.error && !cached.qrcode && !cached.isLogin && Date.now() - cached.at < QRCODE_REFRESH_AFTER) {
+          return json(res, 200, { ready: false, isLogin: false, qrcode: '', phase: '', error: cached.error });
         }
-        const webui = await fetchQrStateOnce(account);
         return json(res, 200, {
           ready: true,
-          isLogin: webui.isLogin,
-          isOffline: webui.isOffline,
-          qrcode: webui.qrcode,
-          phase: webui.phase,
-          error: webui.error,
-          info: webui.info,
+          isLogin: false,
+          qrcode: '',
+          phase: (cached && cached.phase) || 'generating',
+          error: '',
         });
       } catch (err) {
         // 接口异常时若有旧码先展示，同时后台重试，避免弹窗反复转圈。
@@ -858,6 +885,7 @@ async function handleApi(req, res, url) {
     if (parts[3] === 'qr' && method === 'POST') {
       if (MOCK) return json(res, 200, { ok: true });
       try {
+        account.qrSessionAt = Date.now(); // 扫码窗口：保活不重启进程
         const qrcode = await napcat.refreshQrcode(account);
         // 主动刷新后旧缓存作废；拿到新码就直接入缓存，下次轮询秒回。
         qrcodeCache.delete(account.id);

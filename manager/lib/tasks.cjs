@@ -9,6 +9,8 @@ const TASK_KEYS = ['keepalive', 'dailyLike', 'groupSign', 'qzonePost', 'broadcas
 const STARTUP_GRACE_MS = 5 * 60 * 1000;
 /** 保活连续自动重启仍未恢复在线的最大次数，超过后暂停自动重启，避免重启循环加剧风控。 */
 const MAX_KEEPALIVE_RESTARTS = 3;
+/** 扫码窗口：用户打开登录弹窗取码后的一段时间内，保活不重启进程，避免二维码被重启作废。 */
+const QR_SESSION_PROTECT_MS = 5 * 60 * 1000;
 
 const TASK_META = {
   keepalive: { name: '在线保活', desc: '保持电脑 QQ 在线，对应「电脑 QQ 在线 / 连续登录」加速项' },
@@ -254,6 +256,11 @@ class TaskEngine {
     if (!account.qq) {
       this.logger.warn('账号尚未完成首次登录，跳过自动重启，等待扫码', this.meta(account));
       return { ok: false, message: '账号未登录，等待扫码' };
+    }
+    // 用户正在弹窗里扫码重登：重启进程会作废刚生成的二维码、打断登录。
+    if (account.qrSessionAt && Date.now() - Number(account.qrSessionAt) < QR_SESSION_PROTECT_MS) {
+      this.logger.info('扫码登录进行中，暂停自动重启', this.meta(account));
+      return { ok: false, message: '扫码登录进行中，暂停自动重启' };
     }
     // 重启退避：连续多次重启仍不在线，说明会话无法自愈（多为风控或需重扫码），
     // 继续重启只会加剧风控，暂停自动重启并提示人工处理。
