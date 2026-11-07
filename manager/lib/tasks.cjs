@@ -269,7 +269,7 @@ class TaskEngine {
     try {
       await napcat.restartAccount(account);
       this.lastKeepalive.set(account.id, Date.now() + 30000);
-      return { ok: false, message: '探测失败，已重启 NapCat' };
+      return { ok: false, message: '探测失败，已重启 NapCat（登录态已快照保留）' };
     } catch (e) {
       this.logger.error(`重启 NapCat 失败：${e.message}`, this.meta(account));
       return { ok: false, message: `探测失败，重启也失败：${e.message}` };

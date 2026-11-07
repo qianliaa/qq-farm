@@ -549,6 +549,8 @@ async function startAccount(account) {
       return { ok: false, message: 'QQ 运行环境正在安装' };
     }
     await prepareAccount(account);
+    // 登录态目录缺失时（误清/损坏/迁移）用最近快照恢复，保住免扫码自动登录。
+    await restoreSessionStateIfMissing(dirs);
 
     const logFd = fs.openSync(dirs.log, 'a');
     fs.writeSync(logFd, `\n===== ${new Date().toISOString()} 启动 NapCat =====\n`);
@@ -601,9 +603,66 @@ async function startAccount(account) {
   }
 }
 
+/* ------------------------------- 登录态保护 ------------------------------- */
+
+/**
+ * QQ 登录态（设备信息、登录票据）保存在 ~/.config/QQ/nt_qq/global，体积很小。
+ * 每次停止进程前先快照、启动时若目录缺失则用快照恢复，确保各种重启
+ * （保活自动重启、手动重启、面板或 NAS 重启后拉起）都保住登录状态，
+ * 即使进程被 SIGKILL 强杀或断电导致票据损坏，也不必重新扫码。
+ */
+function sessionGlobalDir(dirs) {
+  return path.join(dirs.qqData, 'nt_qq', 'global');
+}
+
+function sessionBackupPaths(dirs) {
+  const live = path.join(dirs.root, 'session-backup');
+  return { staging: `${live}.new`, live, prev: `${live}.prev` };
+}
+
+/** 停止前快照登录态，滚动保留最近两份。 */
+async function backupSessionState(dirs) {
+  const src = sessionGlobalDir(dirs);
+  if (!fs.existsSync(src)) return false;
+  const { staging, live, prev } = sessionBackupPaths(dirs);
+  try {
+    fs.rmSync(staging, { recursive: true, force: true });
+    await runCommand('cp', ['-a', src, staging]);
+    if (fs.existsSync(live)) {
+      fs.rmSync(prev, { recursive: true, force: true });
+      fs.renameSync(live, prev);
+    }
+    fs.renameSync(staging, live);
+    return true;
+  } catch (_e) {
+    fs.rmSync(staging, { recursive: true, force: true });
+    return false;
+  }
+}
+
+/** 启动前若登录态目录缺失（数据被误清或异常损坏），用最近一份快照恢复。 */
+async function restoreSessionStateIfMissing(dirs) {
+  const target = sessionGlobalDir(dirs);
+  if (fs.existsSync(target)) return false;
+  const { live, prev } = sessionBackupPaths(dirs);
+  for (const backup of [live, prev]) {
+    if (!fs.existsSync(backup)) continue;
+    try {
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      await runCommand('cp', ['-a', backup, target]);
+      return true;
+    } catch (_e) {
+      /* 尝试上一份快照 */
+    }
+  }
+  return false;
+}
+
 async function stopAccount(account, { preserveDesired = false } = {}) {
   if (!preserveDesired) account.desiredState = 'stopped';
   const dirs = accountDirs(account);
+  // 先快照登录态再停进程，防止强杀/断电导致票据损坏后无法自动重登。
+  await backupSessionState(dirs);
   const candidate = readPid(account) || Number(account.pid) || 0;
   const pid = candidate && processBelongsToHome(candidate, dirs.home) ? candidate : 0;
   const homePids = findPidsByHome(dirs.home);
@@ -611,7 +670,8 @@ async function stopAccount(account, { preserveDesired = false } = {}) {
 
   for (const item of pids) await killProcessGroup(item);
   if (pids.length) {
-    const gone = await waitGone(pids, 6000);
+    // 给足 10 秒让 QQ 把登录态写盘，尽量避免走到 SIGKILL。
+    const gone = await waitGone(pids, 10000);
     if (!gone) {
       for (const item of pids) {
         if (isAlive(item)) await killProcessGroup(item, { force: true });
@@ -800,6 +860,8 @@ module.exports = {
   startAccount,
   stopAccount,
   restartAccount,
+  backupSessionState,
+  restoreSessionStateIfMissing,
   statusAccount,
   startRuntimeIfNeeded,
   removeAccountRuntime,
