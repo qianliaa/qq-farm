@@ -1232,7 +1232,7 @@ function fillSettings() {
   $('#setRuntimePath').textContent = runtime.template
     ? `安装位置：${runtime.template}${runtime.installLog ? `；日志：${runtime.installLog}` : ''}`
     : '首次使用需安装 Linux QQ 与 NapCat，安装包与日志保存在数据目录。';
-  if ($('#setVersion')) $('#setVersion').textContent = `v${health.version || '2.0.7'}`;
+  if ($('#setVersion')) $('#setVersion').textContent = `v${health.version || '2.0.8'}`;
 }
 
 async function checkUpdate() {
