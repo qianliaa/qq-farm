@@ -1,0 +1,6 @@
+#!/bin/bash
+set -u
+
+mkdir -p "${TRIM_PKGVAR}/accounts" "${TRIM_PKGVAR}/runtime" "${TRIM_PKGVAR}/logs" 2>/dev/null || true
+
+exit 0

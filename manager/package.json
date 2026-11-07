@@ -1,0 +1,14 @@
+{
+  "name": "qq-nas-manager",
+  "version": "1.0.1",
+  "private": true,
+  "description": "飞牛 NAS 多账号 QQ 挂机管理面板（NapCat / OneBot 11）",
+  "main": "server.cjs",
+  "scripts": {
+    "start": "node server.cjs",
+    "dev": "QQNAS_MOCK=1 node server.cjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

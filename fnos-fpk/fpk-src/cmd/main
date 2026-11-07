@@ -1,0 +1,25 @@
+#!/bin/bash
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=common.sh
+. "${SCRIPT_DIR}/common.sh"
+
+case "${1:-}" in
+  start)
+    qqnas_start_manager || exit 1
+    ;;
+  stop)
+    qqnas_stop_all
+    ;;
+  status)
+    if qqnas_manager_pid >/dev/null 2>&1; then
+      exit 0
+    fi
+    exit 3
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+exit 0

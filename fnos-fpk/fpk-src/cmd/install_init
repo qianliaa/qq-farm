@@ -1,0 +1,13 @@
+#!/bin/bash
+set -u
+
+mkdir -p "${TRIM_PKGVAR}/accounts" "${TRIM_PKGVAR}/runtime" "${TRIM_PKGVAR}/logs" 2>/dev/null || true
+
+# Node.js v22 由应用中心依赖 install_dep_apps 自动安装；此处只记录环境状态，不阻塞安装。
+if [ -x /var/apps/nodejs_v22/target/bin/node ]; then
+  echo "Node.js v22 运行环境已就绪" >&2
+else
+  echo "提示：暂未检测到 Node.js v22，应用中心会在安装阶段自动安装依赖。" >&2
+fi
+
+exit 0
