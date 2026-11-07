@@ -15,6 +15,7 @@ install.sh
 .env.example
 manager/lib/docker.cjs
 fnos-fpk/fpk-src/app/docker/
+fnos-fpk/offline-images.sh
 
 # 界面预览图
 preview*.png
