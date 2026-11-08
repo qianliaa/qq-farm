@@ -642,6 +642,20 @@ async function backupSessionState(dirs) {
 
 /** 启动前若登录态目录缺失（数据被误清或异常损坏），用最近一份快照恢复。 */
 async function restoreSessionStateIfMissing(dirs) {
+  const ntDir = path.join(dirs.qqData, 'nt_qq');
+  // 整个 nt_qq 没了：优先用「登录成功后的完整快照」，QQ 起来就是已登录状态。
+  if (!fs.existsSync(ntDir)) {
+    const good = goodSessionDir(dirs);
+    if (fs.existsSync(good)) {
+      try {
+        fs.mkdirSync(dirs.qqData, { recursive: true });
+        await runCommand('cp', ['-a', good, ntDir]);
+        return true;
+      } catch (_e) {
+        /* 退回下面的 global 快照 */
+      }
+    }
+  }
   const target = sessionGlobalDir(dirs);
   if (fs.existsSync(target)) return false;
   const { live, prev } = sessionBackupPaths(dirs);
@@ -658,9 +672,59 @@ async function restoreSessionStateIfMissing(dirs) {
   return false;
 }
 
-async function stopAccount(account, { preserveDesired = false } = {}) {
+/* ------------------------- 登录成功后的完整快照 ------------------------- */
+
+function goodSessionDir(dirs) {
+  return path.join(dirs.root, 'session-good');
+}
+
+/** 登录成功时才做：整份 nt_qq 快照，重启后可直接快速登录，不必重新扫码。 */
+async function snapshotGoodLogin(account) {
+  const dirs = accountDirs(account);
+  const src = path.join(dirs.qqData, 'nt_qq');
+  if (!fs.existsSync(src)) return false;
+  const target = goodSessionDir(dirs);
+  const staging = `${target}.new`;
+  try {
+    fs.rmSync(staging, { recursive: true, force: true });
+    try {
+      // fnOS 用 btrfs，reflink 快照几乎不占空间、瞬间完成。
+      await runCommand('cp', ['-a', '--reflink=auto', src, staging]);
+    } catch (_e) {
+      fs.rmSync(staging, { recursive: true, force: true });
+      await runCommand('cp', ['-a', src, staging]);
+    }
+    fs.rmSync(target, { recursive: true, force: true });
+    fs.renameSync(staging, target);
+    return true;
+  } catch (_e) {
+    fs.rmSync(staging, { recursive: true, force: true });
+    return false;
+  }
+}
+
+function hasGoodLogin(account) {
+  return fs.existsSync(goodSessionDir(accountDirs(account)));
+}
+
+/** 用登录快照覆盖 QQ 数据后重启，让 QQ 直接快速登录，不再要求扫码。 */
+async function restoreGoodLogin(account) {
+  const dirs = accountDirs(account);
+  const src = goodSessionDir(dirs);
+  if (!fs.existsSync(src)) return false;
+  // 恢复前不能再拿当前（可能已损坏）的数据覆盖快照。
+  await stopAccount(account, { preserveDesired: true, snapshotGood: false });
+  const target = path.join(dirs.qqData, 'nt_qq');
+  fs.rmSync(target, { recursive: true, force: true });
+  fs.mkdirSync(dirs.qqData, { recursive: true });
+  await runCommand('cp', ['-a', src, target]);
+  return startAccount(account);
+}
+
+async function stopAccount(account, { preserveDesired = false, snapshotGood = true } = {}) {
   if (!preserveDesired) account.desiredState = 'stopped';
   const dirs = accountDirs(account);
+  const wasOnline = Boolean(account.stats && account.stats.online);
   // 先快照登录态再停进程，防止强杀/断电导致票据损坏后无法自动重登。
   await backupSessionState(dirs);
   const candidate = readPid(account) || Number(account.pid) || 0;
@@ -679,6 +743,8 @@ async function stopAccount(account, { preserveDesired = false } = {}) {
       await waitGone(pids, 2000);
     }
   }
+  // 在线账号正常停止后会写盘，此时再做一份完整快照最干净，重启可免扫码。
+  if (wasOnline && snapshotGood) await snapshotGoodLogin(account);
   try {
     fs.rmSync(dirs.pidFile, { force: true });
   } catch (_e) {
@@ -859,12 +925,13 @@ async function getWebuiLoginState(account) {
  * 此时只有丢掉旧票据才能让 QQ 重新生成二维码。
  */
 async function resetLoginState(account) {
-  await stopAccount(account, { preserveDesired: true });
+  await stopAccount(account, { preserveDesired: true, snapshotGood: false });
   const dirs = accountDirs(account);
   const { live, prev } = sessionBackupPaths(dirs);
   // 旧快照同样是被踢的票据，必须一并清掉，否则下次启动又会被恢复。
   fs.rmSync(live, { recursive: true, force: true });
   fs.rmSync(prev, { recursive: true, force: true });
+  fs.rmSync(goodSessionDir(dirs), { recursive: true, force: true });
   const stale = path.join(dirs.root, 'session-stale');
   fs.rmSync(stale, { recursive: true, force: true });
   try {
@@ -911,6 +978,9 @@ module.exports = {
   getWebuiLoginState,
   refreshQrcode,
   resetLoginState,
+  snapshotGoodLogin,
+  hasGoodLogin,
+  restoreGoodLogin,
   deleteAccountData,
   webuiLogin,
   probePort,

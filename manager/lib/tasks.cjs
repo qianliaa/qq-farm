@@ -76,6 +76,7 @@ class TaskEngine {
     this.lastKeepalive = new Map();
     this.lastContainerSync = 0;
     this.keepaliveFails = new Map();
+    this.lastGoodSnapshot = new Map();
     this.restartAttempts = new Map();
     this.replyCooldowns = new Map();
     this.attempts = new Map();
@@ -240,6 +241,12 @@ class TaskEngine {
       this.keepaliveFails.set(account.id, 0);
       this.restartAttempts.set(account.id, 0);
       account.containerState = 'running';
+      // 在线时每 6 小时留一份完整登录快照，异常断电后还能免扫码恢复。
+      const lastSnap = this.lastGoodSnapshot.get(account.id) || 0;
+      if (Date.now() - lastSnap > 6 * 60 * 60 * 1000) {
+        this.lastGoodSnapshot.set(account.id, Date.now());
+        napcat.snapshotGoodLogin(account).catch(() => {});
+      }
       if (!wasOnline) {
         this.logger.info(`账号已在线：${probe.info && probe.info.nickname ? probe.info.nickname : account.qq || ''}`, this.meta(account));
         // 掉线通知后恢复在线：补一条恢复通知。
@@ -285,6 +292,21 @@ class TaskEngine {
     if (account.qrSessionAt && Date.now() - Number(account.qrSessionAt) < QR_SESSION_PROTECT_MS) {
       this.logger.info('扫码登录进行中，暂停自动重启', this.meta(account));
       return { ok: false, message: '扫码登录进行中，暂停自动重启' };
+    }
+    // 快速登录失效（票据损坏/被清理）时，用登录成功后的完整快照覆盖并重启，
+    // 让 QQ 直接快速登录，不再要求重新扫码。30 分钟内只尝试一次，避免死循环。
+    const lastRestore = Number(account.loginRestoreAt) || 0;
+    if (napcat.hasGoodLogin(account) && Date.now() - lastRestore > 30 * 60 * 1000) {
+      account.loginRestoreAt = Date.now();
+      try {
+        await napcat.restoreGoodLogin(account);
+        this.keepaliveFails.set(account.id, 0);
+        this.lastKeepalive.set(account.id, Date.now() + 45000);
+        this.logger.warn('快速登录失效，已用登录快照恢复，正在自动重新登录', this.meta(account));
+        return { ok: false, message: '已用登录快照恢复，正在自动重新登录' };
+      } catch (e) {
+        this.logger.error(`用登录快照恢复失败：${e.message}`, this.meta(account));
+      }
     }
     // 重启退避：连续多次重启仍不在线，说明会话无法自愈（多为风控或需重扫码），
     // 继续重启只会加剧风控，暂停自动重启并提示人工处理。
