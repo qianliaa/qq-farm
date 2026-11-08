@@ -373,20 +373,25 @@
   <div class="modal-mask hidden" id="authModal">
     <div class="modal small">
       <div class="modal-head">
-        <h3>访问验证</h3>
+        <h3 id="authTitle">访问验证</h3>
       </div>
       <div class="modal-body">
         <label class="field">
           <span>用户名</span>
-          <input id="authUsername" type="text" placeholder="留空即主账号" autocomplete="username">
-          <small>普通用户名由主账号在「全局设置 → 用户管理」中创建；登录一次后长期记住</small>
+          <input id="authUsername" type="text" placeholder="留空即安装主账号" autocomplete="username">
+          <small id="authUsernameHint">也可以用自己的用户名密码登录；登录一次后长期记住</small>
         </label>
         <label class="field">
-          <span>访问密码</span>
-          <input id="authPassword" type="password" placeholder="请输入访问密码" autocomplete="current-password">
-          <small>主账号密码由安装向导设置，可在飞牛应用设置中修改</small>
+          <span>密码</span>
+          <input id="authPassword" type="password" placeholder="请输入密码" autocomplete="current-password">
+          <small id="authPasswordHint">安装主账号密码由安装向导设置，可在飞牛应用设置中修改</small>
+        </label>
+        <label class="field hidden" id="authConfirmField">
+          <span>确认密码</span>
+          <input id="authPassword2" type="password" placeholder="请再次输入密码" autocomplete="new-password">
         </label>
         <p class="auth-error hidden" id="authError">密码不正确，请重试</p>
+        <p style="margin:2px 0 0"><a href="javascript:void(0)" id="authSwitch" style="font-size:13px">还没有账号？注册一个</a></p>
       </div>
       <div class="modal-foot">
         <button class="primary-btn" id="btnAuthLogin">进入面板</button>

@@ -23,6 +23,7 @@ fnos-fpk/dist/*
 !fnos-fpk/dist/qqnas_2.0.16_all.fpk
 !fnos-fpk/dist/qqnas_2.0.17_all.fpk
 !fnos-fpk/dist/qqnas_2.0.18_all.fpk
+!fnos-fpk/dist/qqnas_2.0.19_all.fpk
 
 # 2.0.0 起改用飞牛原生运行时，以下旧 Docker 文件不再参与构建
 docker-compose.yml

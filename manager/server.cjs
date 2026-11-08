@@ -13,7 +13,7 @@ const { Logger } = require('./lib/logger.cjs');
 const napcat = require('./lib/napcat.cjs');
 const { TaskEngine, TASK_KEYS, TASK_META } = require('./lib/tasks.cjs');
 
-const APP_VERSION = '2.0.18';
+const APP_VERSION = '2.0.19';
 const UPDATE_REPO = (process.env.QQNAS_UPDATE_REPO || 'qianliaa/qq-online').trim();
 const PORT = Number(process.env.PORT) || 8787;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -40,6 +40,7 @@ const MANAGER_INTERNAL_URL =
 const store = new Store();
 const logger = new Logger({ dir: path.join(DATA_DIR, 'logs'), limit: store.settings.logLimit });
 const notifyChannel = require('./lib/notify.cjs');
+const fnosUser = require('./lib/fnos-user.cjs');
 
 /** 保活触发的用户通知：按账号归属人读取其通知配置。 */
 async function dispatchNotify(account, kind) {
@@ -255,7 +256,7 @@ function resolveAuthUser(req) {
   for (const user of store.users) {
     if (!user.passwordHash) continue;
     if (safeEqual(actual, sessionToken(user.id, user.passwordHash))) {
-      return { id: user.id, name: user.name, admin: false };
+      return { id: user.id, name: user.name, admin: Boolean(user.admin) };
     }
   }
   return null;
@@ -794,10 +795,15 @@ async function handleApi(req, res, url) {
 
   if (url.pathname === '/api/session' && method === 'GET') {
     const current = resolveAuthUser(req);
+    // 注册时按飞牛登录身份定权限：只有飞牛主账号（UID 1000）注册出来的才是主账号。
+    const identity = fnosUser.detect(req);
     return json(res, 200, {
       // 始终用账号密码登录一次，之后长期记住。
       authRequired: true,
       adminPasswordSet: Boolean(ACCESS_PASSWORD),
+      registrationOpen: true,
+      canRegisterAdmin: fnosUser.isAdmin(identity),
+      identity: identity ? { uid: identity.uid, name: identity.name, admin: identity.admin } : null,
       authed: Boolean(current),
       user: current ? { id: current.id, name: current.name, admin: current.admin } : null,
     });
@@ -823,7 +829,7 @@ async function handleApi(req, res, url) {
       if (!passwordOk) {
         return json(res, 401, { error: '用户名或密码不正确' });
       }
-      user = { id: found.id, name: found.name, admin: false };
+      user = { id: found.id, name: found.name, admin: Boolean(found.admin) };
       token = sessionToken(found.id, found.passwordHash);
     }
     const cookie = `qqnas_auth=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_MAX_AGE}`;
@@ -834,6 +840,43 @@ async function handleApi(req, res, url) {
   if (url.pathname === '/api/logout' && method === 'POST') {
     res.setHeader('Set-Cookie', 'qqnas_auth=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
     return json(res, 200, { ok: true });
+  }
+
+  /* 自助注册：每个飞牛用户都能注册自己的账号密码，注册后自动登录。 */
+  if (url.pathname === '/api/register' && method === 'POST') {
+    const body = await readBody(req);
+    const name = String(body.name || body.username || '').trim();
+    if (!/^[\w一-龥-]{2,20}$/.test(name)) {
+      return json(res, 400, { error: '用户名需 2–20 位，可用中英文、数字、下划线' });
+    }
+    if (name.toLowerCase() === 'admin') return json(res, 400, { error: '该用户名为系统保留' });
+    if (store.findUserByName(name)) return json(res, 400, { error: '用户名已被注册' });
+    const password = String(body.password || '');
+    if (password.length < 6) return json(res, 400, { error: '密码至少 6 位' });
+
+    // 权限只看飞牛登录身份：飞牛主账号（UID 1000）注册即主账号，其他人注册为普通用户。
+    const identity = fnosUser.detect(req);
+    const admin = fnosUser.isAdmin(identity);
+    const created = store.addUser({
+      id: crypto.randomBytes(6).toString('hex'),
+      name,
+      passwordHash: userPasswordHash(name, password),
+      admin,
+      fnosUid: identity ? identity.uid : '',
+      createdAt: Date.now(),
+    });
+    const token = sessionToken(created.id, created.passwordHash);
+    res.setHeader(
+      'Set-Cookie',
+      `qqnas_auth=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_MAX_AGE}`
+    );
+    logger.info(`新用户注册：${name}${admin ? '（主账号）' : ''}`, { fnosUid: created.fnosUid });
+    return json(res, 201, {
+      ok: true,
+      token,
+      user: { id: created.id, name: created.name, admin },
+      canRegisterAdmin: admin,
+    });
   }
 
   const user = resolveAuthUser(req);
@@ -933,6 +976,7 @@ async function handleApi(req, res, url) {
       users: store.users.map((u) => ({
         id: u.id,
         name: u.name,
+        admin: Boolean(u.admin),
         createdAt: u.createdAt,
         accounts: store.accounts.filter((a) => (a.owner || 'admin') === u.id).length,
       })),

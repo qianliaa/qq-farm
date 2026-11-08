@@ -59,6 +59,8 @@ const state = {
   runtime: {},
   health: null,
   authRequired: false,
+  authMode: 'login', // login | register
+  canRegisterAdmin: false,
   currentId: storageGet('qqnas.current'),
   status: null,
   renderedAccountId: '',
@@ -225,6 +227,27 @@ async function api(path, options = {}, retry = true) {
   }
 }
 
+/** 登录 / 注册两种模式共用一个弹窗。 */
+function setAuthMode(mode) {
+  state.authMode = mode === 'register' ? 'register' : 'login';
+  const register = state.authMode === 'register';
+  $('#authTitle').textContent = register ? '注册账号' : '访问验证';
+  $('#btnAuthLogin').textContent = register ? '注册并登录' : '进入面板';
+  $('#authConfirmField').classList.toggle('hidden', !register);
+  $('#authSwitch').textContent = register ? '已有账号？返回登录' : '还没有账号？注册一个';
+  $('#authUsername').placeholder = register ? '2–20 位，中英文/数字/下划线' : '留空即安装主账号';
+  $('#authUsernameHint').textContent = register
+    ? state.canRegisterAdmin
+      ? '当前是飞牛主账号，注册后拥有用户管理权限'
+      : '注册后自动登录，只看到并管理自己的 QQ 账号'
+    : '也可以用自己的用户名密码登录；登录一次后长期记住';
+  $('#authPasswordHint').textContent = register
+    ? '至少 6 位，请牢记，忘记需由主账号重置'
+    : '安装主账号密码由安装向导设置，可在飞牛应用设置中修改';
+  $('#authError').classList.add('hidden');
+  setTimeout(() => $(register ? '#authUsername' : '#authPassword').focus(), 60);
+}
+
 function showAuth() {
   if (state.authResolver) return new Promise((resolve) => {
     const previous = state.authResolver;
@@ -234,27 +257,46 @@ function showAuth() {
     };
   });
   openModal('authModal');
-  setTimeout(() => $('#authPassword').focus(), 60);
+  setAuthMode('login');
   return new Promise((resolve) => {
     state.authResolver = resolve;
   });
 }
 
 async function submitAuth() {
+  const register = state.authMode === 'register';
   const username = ($('#authUsername') && $('#authUsername').value.trim()) || '';
   const password = $('#authPassword').value;
-  $('#authError').classList.add('hidden');
+  const confirm = $('#authPassword2') ? $('#authPassword2').value : '';
+  const errorBox = $('#authError');
+  errorBox.classList.add('hidden');
+
+  if (register && password !== confirm) {
+    errorBox.textContent = '两次输入的密码不一致';
+    errorBox.classList.remove('hidden');
+    return;
+  }
+
   try {
-    const data = await rawApi('/api/login', { method: 'POST', body: JSON.stringify({ username, password }) });
+    const path = register ? '/api/register' : '/api/login';
+    const body = register ? { name: username, password } : { username, password };
+    const data = await rawApi(path, { method: 'POST', body: JSON.stringify(body) });
     // 只需输入一次：令牌长期保存，下次打开自动登录。
     if (data && data.token) storageSet(TOKEN_KEY, data.token);
     closeModal('authModal');
     $('#authPassword').value = '';
+    if ($('#authPassword2')) $('#authPassword2').value = '';
     const resolver = state.authResolver;
     state.authResolver = null;
     if (resolver) resolver(true);
-  } catch (_e) {
-    $('#authError').classList.remove('hidden');
+    if (register) {
+      // 注册后身份、权限都变了，整页重载拿到新的会话与账号列表。
+      toast(data && data.user && data.user.admin ? '注册成功，已获得主账号权限' : '注册成功，已自动登录', 'success');
+      setTimeout(() => location.reload(), 600);
+    }
+  } catch (error) {
+    errorBox.textContent = (error && error.message) || '操作失败，请重试';
+    errorBox.classList.remove('hidden');
   }
 }
 
@@ -1302,7 +1344,7 @@ async function loadUsers() {
     const users = data.users || [];
     const hint = $('#userManageHint');
     if (hint) {
-      hint.textContent = '每个用户只看到并管理自己的 QQ 账号；把用户名和初始密码告诉对应的飞牛用户即可。';
+      hint.textContent = '飞牛用户可在登录页自行注册；每个用户只看到并管理自己的 QQ 账号，主账号可重置密码或删除。';
     }
     if (!users.length) {
       list.innerHTML = '<small style="opacity:.6">还没有额外用户。为其他飞牛用户各建一个账号空间吧。</small>';
@@ -1311,7 +1353,7 @@ async function loadUsers() {
     list.innerHTML = users
       .map(
         (u) => `<div class="runtime-setting-actions" style="align-items:center;margin:6px 0">
-          <b style="flex:1;min-width:0">${esc(u.name)}</b>
+          <b style="flex:1;min-width:0">${esc(u.name)}${u.admin ? ' <small style="opacity:.65">(主账号)</small>' : ''}</b>
           <small style="opacity:.7">${u.accounts} 个账号</small>
           <button class="ghost-btn small" data-reset="${esc(u.id)}" data-name="${esc(u.name)}">重置密码</button>
           <button class="ghost-btn small" data-del="${esc(u.id)}" data-name="${esc(u.name)}">删除</button>
@@ -1462,6 +1504,16 @@ function bindEvents() {
   if ($('#authUsername')) {
     $('#authUsername').addEventListener('keydown', (event) => {
       if (event.key === 'Enter') submitAuth();
+    });
+  }
+  if ($('#authPassword2')) {
+    $('#authPassword2').addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') submitAuth();
+    });
+  }
+  if ($('#authSwitch')) {
+    $('#authSwitch').addEventListener('click', () => {
+      setAuthMode(state.authMode === 'register' ? 'login' : 'register');
     });
   }
   if ($('#btnAddUser')) $('#btnAddUser').addEventListener('click', addUser);
@@ -1678,7 +1730,8 @@ async function init() {
   try {
     const session = await rawApi('/api/session', { timeout: 10000 });
     state.authRequired = Boolean(session.authRequired);
-    // 账号密码登录一次后长期记住，没登录过才弹框。
+    state.canRegisterAdmin = Boolean(session.canRegisterAdmin);
+    // 账号密码登录一次后长期记住；没登录过就弹框（可直接注册新账号）。
     if (!session.authed) await showAuth();
   } catch (_e) {
     /* 会话接口异常时仍然继续尝试加载，下面会给出明确提示 */
