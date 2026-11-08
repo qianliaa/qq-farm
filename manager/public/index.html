@@ -326,7 +326,7 @@
           </div>
         </div>
         <div class="field span-2" id="userManageBox">
-          <span>用户管理（飞牛用户间隔离）</span>
+          <span>用户管理（仅主账号可见）</span>
           <small id="userManageHint">每个用户只看到并管理自己的 QQ 账号。</small>
           <div id="userList"></div>
           <div class="runtime-setting-actions" id="userAddRow">
@@ -378,13 +378,13 @@
       <div class="modal-body">
         <label class="field">
           <span>用户名</span>
-          <input id="authUsername" type="text" placeholder="留空即主用户" autocomplete="username">
-          <small>主用户以外的用户名由主用户在「全局设置 → 用户管理」中创建</small>
+          <input id="authUsername" type="text" placeholder="留空即主账号" autocomplete="username">
+          <small>普通用户名由主账号在「全局设置 → 用户管理」中创建；登录一次后长期记住</small>
         </label>
         <label class="field">
           <span>访问密码</span>
           <input id="authPassword" type="password" placeholder="请输入访问密码" autocomplete="current-password">
-          <small>主用户密码由安装向导设置，可在飞牛应用设置中修改</small>
+          <small>主账号密码由安装向导设置，可在飞牛应用设置中修改</small>
         </label>
         <p class="auth-error hidden" id="authError">密码不正确，请重试</p>
       </div>

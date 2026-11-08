@@ -22,17 +22,13 @@ function apiUrl(path) {
 
 /**
  * 飞牛 Web UI 用 iframe 打开应用时，跨站 Cookie 可能被浏览器拦截。
- * 登录后把令牌放进 sessionStorage，并通过请求头带给服务端。
+ * 登录后把令牌持久保存，只需输入一次账号密码，之后自动登录。
  */
 const TOKEN_KEY = 'qqnas.token';
 
 function authHeaders() {
-  try {
-    const token = sessionStorage.getItem(TOKEN_KEY) || '';
-    return token ? { 'X-QQNAS-Token': token } : {};
-  } catch (_e) {
-    return {};
-  }
+  const token = storageGet(TOKEN_KEY);
+  return token ? { 'X-QQNAS-Token': token } : {};
 }
 
 /**
@@ -250,13 +246,8 @@ async function submitAuth() {
   $('#authError').classList.add('hidden');
   try {
     const data = await rawApi('/api/login', { method: 'POST', body: JSON.stringify({ username, password }) });
-    if (data && data.token) {
-      try {
-        sessionStorage.setItem(TOKEN_KEY, data.token);
-      } catch (_e) {
-        /* 隐私模式下可能不可写，Cookie 仍可兜底 */
-      }
-    }
+    // 只需输入一次：令牌长期保存，下次打开自动登录。
+    if (data && data.token) storageSet(TOKEN_KEY, data.token);
     closeModal('authModal');
     $('#authPassword').value = '';
     const resolver = state.authResolver;
@@ -1235,7 +1226,7 @@ function fillSettings() {
     ? `安装位置：${runtime.template}${runtime.installLog ? `；日志：${runtime.installLog}` : ''}`
     : '首次使用需安装 Linux QQ 与 NapCat，安装包与日志保存在数据目录。';
   if ($('#setVersion')) $('#setVersion').textContent = `v${health.version || '2.0.8'}`;
-  // 用户管理仅主用户可见可用；普通用户打开设置也只读。
+  // 用户管理仅主账号可见可用；普通用户打开设置也只读。
   const isAdmin = Boolean(state.user && state.user.admin);
   const box = $('#userManageBox');
   if (box) box.classList.toggle('hidden', !isAdmin);
@@ -1299,29 +1290,20 @@ async function loadUsers() {
   try {
     const data = await api('/api/users');
     const users = data.users || [];
-    // 无访问密码时身份由飞牛登录态自动识别，不需要手工建用户。
-    const autoIdentity = Boolean(data.autoIdentity);
-    const addRow = $('#userAddRow');
-    if (addRow) addRow.classList.toggle('hidden', autoIdentity);
     const hint = $('#userManageHint');
     if (hint) {
-      hint.textContent = autoIdentity
-        ? '身份来自飞牛登录账号，首次访问自动建档，无需密码；每个飞牛用户只看到自己的 QQ 账号。'
-        : '每个用户只看到并管理自己的 QQ 账号；把用户名和初始密码告诉对应的飞牛用户即可。';
+      hint.textContent = '每个用户只看到并管理自己的 QQ 账号；把用户名和初始密码告诉对应的飞牛用户即可。';
     }
     if (!users.length) {
-      list.innerHTML = autoIdentity
-        ? '<small style="opacity:.6">还没有用户访问过。飞牛用户打开本应用后会自动出现在这里。</small>'
-        : '<small style="opacity:.6">还没有额外用户。为其他飞牛用户各建一个账号空间吧。</small>';
+      list.innerHTML = '<small style="opacity:.6">还没有额外用户。为其他飞牛用户各建一个账号空间吧。</small>';
       return;
     }
     list.innerHTML = users
       .map(
         (u) => `<div class="runtime-setting-actions" style="align-items:center;margin:6px 0">
           <b style="flex:1;min-width:0">${esc(u.name)}</b>
-          ${u.fnosUid ? `<small style="opacity:.7">UID ${esc(u.fnosUid)}</small>` : ''}
           <small style="opacity:.7">${u.accounts} 个账号</small>
-          ${u.fnosUid ? '' : `<button class="ghost-btn small" data-reset="${esc(u.id)}" data-name="${esc(u.name)}">重置密码</button>`}
+          <button class="ghost-btn small" data-reset="${esc(u.id)}" data-name="${esc(u.name)}">重置密码</button>
           <button class="ghost-btn small" data-del="${esc(u.id)}" data-name="${esc(u.name)}">删除</button>
         </div>`
       )
@@ -1686,8 +1668,8 @@ async function init() {
   try {
     const session = await rawApi('/api/session', { timeout: 10000 });
     state.authRequired = Boolean(session.authRequired);
-    // 无访问密码时身份由飞牛登录态自动识别，不弹登录框；只有设了密码才需要登录。
-    if (session.authRequired && !session.authed) await showAuth();
+    // 账号密码登录一次后长期记住，没登录过才弹框。
+    if (!session.authed) await showAuth();
   } catch (_e) {
     /* 会话接口异常时仍然继续尝试加载，下面会给出明确提示 */
   }

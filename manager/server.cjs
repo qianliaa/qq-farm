@@ -13,7 +13,7 @@ const { Logger } = require('./lib/logger.cjs');
 const napcat = require('./lib/napcat.cjs');
 const { TaskEngine, TASK_KEYS, TASK_META } = require('./lib/tasks.cjs');
 
-const APP_VERSION = '2.0.16';
+const APP_VERSION = '2.0.17';
 const UPDATE_REPO = (process.env.QQNAS_UPDATE_REPO || 'qianliaa/qq-online').trim();
 const PORT = Number(process.env.PORT) || 8787;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -40,7 +40,6 @@ const MANAGER_INTERNAL_URL =
 const store = new Store();
 const logger = new Logger({ dir: path.join(DATA_DIR, 'logs'), limit: store.settings.logLimit });
 const notifyChannel = require('./lib/notify.cjs');
-const fnosUser = require('./lib/fnos-user.cjs');
 
 /** 保活触发的用户通知：按账号归属人读取其通知配置。 */
 async function dispatchNotify(account, kind) {
@@ -217,10 +216,18 @@ function sessionToken(userId, secret) {
   return crypto.createHash('sha256').update(`token:${userId}:${secret}:qqnas`).digest('hex');
 }
 
-/** 主用户（安装向导设置的访问密码）不落用户表，id 固定为 admin。 */
-const ADMIN_USER = { id: 'admin', name: '主用户', admin: true };
+/** 主账号（管理员）不落用户表，id 固定为 admin；密码取安装向导的访问密码。 */
+const ADMIN_USER = { id: 'admin', name: '主账号', admin: true };
 
-/** 飞牛用户间隔离：账号归属当前登录用户；旧数据没有 owner，归主用户。 */
+/** 会话有效期：登录一次长期记住，180 天。 */
+const SESSION_MAX_AGE = 180 * 24 * 3600;
+
+/** 主账号密码的令牌种子：未设访问密码时用空密码派生。 */
+function adminSeed() {
+  return passwordHash(ACCESS_PASSWORD || '');
+}
+
+/** 用户间隔离：账号归属登录用户；旧数据没有 owner，归主账号。 */
 function owns(user, account) {
   return (account.owner || 'admin') === user.id;
 }
@@ -241,47 +248,10 @@ function requestToken(req) {
   return actual;
 }
 
-/** 飞牛超级管理员 UID 固定为 1000，对应本应用的主用户。 */
-const FNOS_ADMIN_UID = '1000';
-
-/**
- * 无访问密码模式：按飞牛登录身份自动建档并返回用户，实现零操作的用户隔离。
- * 识别不到身份（例如绕过飞牛代理直连端口）时回退主用户，并记录一次告警。
- */
-let identityFallbackWarned = false;
-function ensureFnosUser(req) {
-  const identity = fnosUser.detect(req);
-  if (!identity) {
-    if (!identityFallbackWarned) {
-      identityFallbackWarned = true;
-      logger.warn('未识别到飞牛登录身份，暂按主用户处理；请通过飞牛应用入口访问以启用用户隔离');
-    }
-    return ADMIN_USER;
-  }
-  const name = identity.name || (identity.uid === FNOS_ADMIN_UID ? '管理员' : `飞牛用户${identity.uid}`);
-  let record = store.findUser(identity.id);
-  if (!record) {
-    record = store.addUser({
-      id: identity.id,
-      name,
-      passwordHash: '',
-      fnosUid: identity.uid || '',
-      createdAt: Date.now(),
-    });
-    logger.info(`已从飞牛登录身份建档用户：${name}（${identity.source}）`);
-  } else if (record.name !== name) {
-    record.name = name;
-    store.save();
-  }
-  return { id: record.id, name: record.name, admin: Boolean(identity.uid) && identity.uid === FNOS_ADMIN_UID };
-}
-
 function resolveAuthUser(req) {
-  // 无访问密码：身份完全来自飞牛登录态，无需任何登录步骤。
-  if (!ACCESS_PASSWORD) return ensureFnosUser(req);
   const actual = requestToken(req);
   if (!actual) return null;
-  if (safeEqual(actual, sessionToken('admin', passwordHash(ACCESS_PASSWORD)))) return ADMIN_USER;
+  if (safeEqual(actual, sessionToken('admin', adminSeed()))) return ADMIN_USER;
   for (const user of store.users) {
     if (!user.passwordHash) continue;
     if (safeEqual(actual, sessionToken(user.id, user.passwordHash))) {
@@ -289,10 +259,6 @@ function resolveAuthUser(req) {
     }
   }
   return null;
-}
-
-function isAuthed(req) {
-  return Boolean(resolveAuthUser(req));
 }
 
 function safeEqual(a, b) {
@@ -732,41 +698,38 @@ async function handleApi(req, res, url) {
   if (url.pathname === '/api/session' && method === 'GET') {
     const current = resolveAuthUser(req);
     return json(res, 200, {
-      authRequired: Boolean(ACCESS_PASSWORD),
+      // 始终用账号密码登录一次，之后长期记住。
+      authRequired: true,
+      adminPasswordSet: Boolean(ACCESS_PASSWORD),
       authed: Boolean(current),
       user: current ? { id: current.id, name: current.name, admin: current.admin } : null,
     });
   }
 
   if (url.pathname === '/api/login' && method === 'POST') {
-    // 无访问密码：身份由飞牛登录态决定，无登录步骤。
-    if (!ACCESS_PASSWORD) {
-      return json(res, 200, { ok: true, user: resolveAuthUser(req) });
-    }
     const body = await readBody(req);
     const username = String(body.username || '').trim();
+    const password = String(body.password || '');
     let user = null;
     let token = '';
     if (!username) {
-      // 用户名留空即主用户（安装向导设置的访问密码），兼容旧习惯。
-      if (!safeEqual(body.password || '', ACCESS_PASSWORD)) {
-        return json(res, 401, { error: '访问密码不正确' });
+      // 用户名留空即主账号（管理员），密码为安装向导设置的访问密码。
+      if (ACCESS_PASSWORD && !safeEqual(password, ACCESS_PASSWORD)) {
+        return json(res, 401, { error: '主账号密码不正确' });
       }
       user = ADMIN_USER;
-      token = sessionToken('admin', passwordHash(ACCESS_PASSWORD));
+      token = sessionToken('admin', adminSeed());
     } else {
       const found = store.findUserByName(username);
       const passwordOk = Boolean(found && found.passwordHash)
-        && safeEqual(userPasswordHash(username, body.password || ''), found.passwordHash);
+        && safeEqual(userPasswordHash(username, password), found.passwordHash);
       if (!passwordOk) {
         return json(res, 401, { error: '用户名或密码不正确' });
       }
       user = { id: found.id, name: found.name, admin: false };
       token = sessionToken(found.id, found.passwordHash);
     }
-    const cookie = `qqnas_auth=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${
-      7 * 24 * 3600
-    }`;
+    const cookie = `qqnas_auth=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_MAX_AGE}`;
     res.setHeader('Set-Cookie', cookie);
     return json(res, 200, { ok: true, token, user });
   }
@@ -805,7 +768,7 @@ async function handleApi(req, res, url) {
       engine: runtimeSnapshot().status,
       runtime: runtimeSnapshot(),
       taskMeta: TASK_META,
-      authRequired: Boolean(ACCESS_PASSWORD),
+      authRequired: true,
       user: { id: user.id, name: user.name, admin: user.admin },
       version: APP_VERSION,
     });
@@ -816,7 +779,7 @@ async function handleApi(req, res, url) {
   }
 
   if (url.pathname === '/api/settings' && method === 'PATCH') {
-    if (!user.admin) return json(res, 403, { error: '全局设置仅主用户可修改' });
+    if (!user.admin) return json(res, 403, { error: '全局设置仅主账号可修改' });
     const body = await readBody(req);
     const settings = store.updateSettings(body);
     logger.info('已更新全局设置');
@@ -865,39 +828,28 @@ async function handleApi(req, res, url) {
     }
   }
 
-  /* 用户管理：仅主用户。无密码模式下用户由飞牛登录身份自动建档，无需手动创建。 */
+  /* 用户管理：仅主账号（管理员）。主账号为每个飞牛用户创建独立的用户名+密码。 */
 
   if (url.pathname === '/api/users' && method === 'GET') {
-    if (!user.admin) return json(res, 403, { error: '仅主用户可管理用户' });
+    if (!user.admin) return json(res, 403, { error: '仅主账号可管理用户' });
     return json(res, 200, {
-      autoIdentity: !ACCESS_PASSWORD,
       users: store.users.map((u) => ({
         id: u.id,
         name: u.name,
-        fnosUid: u.fnosUid || '',
         createdAt: u.createdAt,
         accounts: store.accounts.filter((a) => (a.owner || 'admin') === u.id).length,
       })),
     });
   }
 
-  if (url.pathname === '/api/identity' && method === 'GET') {
-    // 排查用：查看当前请求携带的身份线索。仅主用户可见。
-    if (!user.admin) return json(res, 403, { error: '仅主用户可查看' });
-    return json(res, 200, { identity: fnosUser.inspect(req), current: user });
-  }
-
   if (url.pathname === '/api/users' && method === 'POST') {
-    if (!user.admin) return json(res, 403, { error: '仅主用户可管理用户' });
-    // 无密码模式下用户来自飞牛登录身份，不允许手工创建。
-    if (!ACCESS_PASSWORD) {
-      return json(res, 400, { error: '无访问密码模式下，用户由飞牛登录身份自动创建，无需手动添加' });
-    }
+    if (!user.admin) return json(res, 403, { error: '仅主账号可管理用户' });
     const body = await readBody(req);
     const name = String(body.name || '').trim();
     if (!/^[\w一-龥-]{2,20}$/.test(name)) {
       return json(res, 400, { error: '用户名需 2–20 位，可用中英文、数字、下划线' });
     }
+    if (name.toLowerCase() === 'admin') return json(res, 400, { error: '该用户名为系统保留' });
     if (store.findUserByName(name)) return json(res, 400, { error: '用户名已存在' });
     const password = String(body.password || '');
     if (password.length < 6) return json(res, 400, { error: '密码至少 6 位' });
@@ -912,7 +864,7 @@ async function handleApi(req, res, url) {
   }
 
   if (parts[1] === 'users' && parts[2]) {
-    if (!user.admin) return json(res, 403, { error: '仅主用户可管理用户' });
+    if (!user.admin) return json(res, 403, { error: '仅主账号可管理用户' });
     const target = store.findUser(parts[2]);
     if (!target) return json(res, 404, { error: '用户不存在' });
 
@@ -927,10 +879,6 @@ async function handleApi(req, res, url) {
     }
 
     if (parts[3] === 'password' && method === 'POST') {
-      // 飞牛身份用户没有本站密码，密码只属于设了访问密码时手工创建的账号。
-      if (!ACCESS_PASSWORD || target.fnosUid) {
-        return json(res, 400, { error: '该用户身份由飞牛登录态提供，无需设置密码' });
-      }
       const body = await readBody(req);
       const password = String(body.password || '');
       if (password.length < 6) return json(res, 400, { error: '密码至少 6 位' });
