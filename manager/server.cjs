@@ -13,7 +13,7 @@ const { Logger } = require('./lib/logger.cjs');
 const napcat = require('./lib/napcat.cjs');
 const { TaskEngine, TASK_KEYS, TASK_META } = require('./lib/tasks.cjs');
 
-const APP_VERSION = '2.0.17';
+const APP_VERSION = '2.0.18';
 const UPDATE_REPO = (process.env.QQNAS_UPDATE_REPO || 'qianliaa/qq-online').trim();
 const PORT = Number(process.env.PORT) || 8787;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -481,6 +481,7 @@ function fetchQrStateOnce(account) {
       webui.fetchedAt = fetchedAt;
       cacheQrState(account.id, webui);
       applyWebuiLogin(account, webui);
+      trackQrProgress(account, webui);
       return webui;
     })
     .finally(() => {
@@ -493,6 +494,8 @@ function fetchQrStateOnce(account) {
 }
 
 function refreshQrStateInBackground(account) {
+  // 正在重置登录态时不要取码，否则重启中的 WebUI 会返回一堆报错覆盖缓存。
+  if (qrResetting.has(account.id)) return;
   const cached = qrcodeCache.get(account.id);
   if (cached && cached.refreshing) return;
   if (cached) cached.refreshing = true;
@@ -510,6 +513,100 @@ function refreshQrStateInBackground(account) {
       refreshing: false,
     });
   });
+}
+
+/* ---------------- 二维码取不到时的自愈：重置本地登录态 ---------------- */
+
+/**
+ * 账号被踢下线后，内核会拿本地旧票据反复重登、始终不进扫码页，
+ * 表现为二维码永远是空、也没有任何报错。连续多轮取不到码就丢掉票据重启，
+ * 强制 QQ 回到扫码登录界面重新出码。
+ */
+const QR_EMPTY_ROUNDS_BEFORE_RESET = 3;
+const QR_RESET_TIMEOUT = 180 * 1000;
+const qrEmptyRounds = new Map();
+const qrResetting = new Set();
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function trackQrProgress(account, webui) {
+  if (webui.isLogin || webui.qrcode) {
+    qrEmptyRounds.delete(account.id);
+    return;
+  }
+  const rounds = (qrEmptyRounds.get(account.id) || 0) + 1;
+  qrEmptyRounds.set(account.id, rounds);
+  if (rounds >= QR_EMPTY_ROUNDS_BEFORE_RESET) resetAccountForQrcode(account);
+}
+
+async function waitQrcodeAfterReset(account, timeoutMs = QR_RESET_TIMEOUT) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await delay(2500);
+    const info = await napcat.statusAccount(account).catch(() => null);
+    if (!info || !info.webuiReady) continue;
+    const webui = await napcat.getWebuiLoginState(account).catch(() => null);
+    if (!webui) continue;
+    account.qrSessionAt = Date.now();
+    if (webui.isLogin || webui.qrcode) {
+      cacheQrState(account.id, { ...webui, fetchedAt: Date.now() });
+      applyWebuiLogin(account, webui);
+      qrEmptyRounds.delete(account.id);
+      return webui;
+    }
+  }
+  throw new Error('重置登录态后仍未出码，请打开完整 WebUI 查看');
+}
+
+/** 两次自动重置之间的最小间隔，避免反复重启把账号拖死。 */
+const QR_RESET_COOLDOWN = 5 * 60 * 1000;
+
+function resetAccountForQrcode(account, { force = false } = {}) {
+  if (qrResetting.has(account.id)) return;
+  if (!force && Date.now() - (Number(account.qrResetAt) || 0) < QR_RESET_COOLDOWN) return;
+  account.qrResetAt = Date.now();
+  qrResetting.add(account.id);
+  qrEmptyRounds.delete(account.id);
+  qrcodeCache.set(account.id, {
+    qrcode: '',
+    isLogin: false,
+    isOffline: false,
+    phase: 'resetting',
+    error: '登录票据已失效，正在重置登录状态并重新生成二维码…',
+    info: null,
+    at: Date.now(),
+    freshAt: Date.now(),
+    refreshing: false,
+  });
+  logger.warn('二维码连续为空，重置本地登录态并重启账号', {
+    accountId: account.id,
+    account: account.alias,
+  });
+  account.qrSessionAt = Date.now();
+  napcat
+    .resetLoginState(account)
+    .then(() => waitQrcodeAfterReset(account))
+    .then(() => logger.info('已重新生成二维码', { accountId: account.id, account: account.alias }))
+    .catch((err) => {
+      logger.error(`重置登录态失败：${err.message}`, { accountId: account.id, account: account.alias });
+      qrcodeCache.set(account.id, {
+        qrcode: '',
+        isLogin: false,
+        isOffline: false,
+        phase: '',
+        error: err.message,
+        info: null,
+        at: Date.now(),
+        freshAt: Date.now(),
+        refreshing: false,
+      });
+    })
+    .finally(() => {
+      qrResetting.delete(account.id);
+      statusCache.delete(account.id);
+    });
 }
 
 async function probeAccount(account, { force = false } = {}) {
@@ -912,6 +1009,8 @@ async function handleApi(req, res, url) {
         logger.warn(`账号数据目录已删除：${account.id}`, { accountId: account.id, account: account.alias });
       }
       statusCache.delete(account.id);
+      qrcodeCache.delete(account.id);
+      qrEmptyRounds.delete(account.id);
       return json(res, 200, { ok: true, purged: purge });
     }
 
@@ -956,6 +1055,7 @@ async function handleApi(req, res, url) {
       store.save();
       statusCache.delete(account.id);
       qrcodeCache.delete(account.id); // 启停/重启/重建后旧二维码作废
+      qrEmptyRounds.delete(account.id);
       logger.info(`账号操作：${action}`, { accountId: account.id, account: account.alias });
       return json(res, 200, { ok: true, account: publicAccount(account) });
     }
@@ -1012,6 +1112,16 @@ async function handleApi(req, res, url) {
         // 否则重启会作废刚生成的二维码、打断扫码登录。
         account.qrSessionAt = Date.now();
         const cached = qrcodeCache.get(account.id);
+        // 正在重置登录态：明确告诉前端在做什么，避免弹窗一直空白。
+        if (qrResetting.has(account.id)) {
+          return json(res, 200, {
+            ready: false,
+            isLogin: false,
+            qrcode: '',
+            phase: 'resetting',
+            error: (cached && cached.error) || '正在重置登录状态并重新生成二维码…',
+          });
+        }
         // 已登录：缓存很新才可信（掉线后旧登录态不能当真），否则后台复核。
         if (cached && cached.isLogin && Date.now() - cached.at < QRCODE_REFRESH_AFTER) {
           return json(res, 200, {
@@ -1074,13 +1184,21 @@ async function handleApi(req, res, url) {
       if (MOCK) return json(res, 200, { ok: true });
       try {
         account.qrSessionAt = Date.now(); // 扫码窗口：保活不重启进程
+        qrEmptyRounds.delete(account.id);
         const qrcode = await napcat.refreshQrcode(account);
         // 主动刷新后旧缓存作废；拿到新码就直接入缓存，下次轮询秒回。
         qrcodeCache.delete(account.id);
-        if (qrcode) cacheQrState(account.id, { qrcode, isLogin: false });
-        return json(res, 200, { ok: true, qrcode });
+        if (qrcode) {
+          cacheQrState(account.id, { qrcode, isLogin: false });
+          return json(res, 200, { ok: true, qrcode });
+        }
+        // 主动刷新也拿不到码：旧票据已失效，重置登录态后重新出码（后台进行）。
+        resetAccountForQrcode(account, { force: true });
+        return json(res, 200, { ok: true, resetting: true });
       } catch (err) {
-        return json(res, 500, { error: err.message });
+        // 取码超时同样说明内核没进扫码阶段，按失效处理。
+        resetAccountForQrcode(account, { force: true });
+        return json(res, 200, { ok: true, resetting: true, error: err.message });
       }
     }
 

@@ -969,7 +969,9 @@ async function pollQr() {
           ? '正在安装 QQ 运行环境'
           : data.phase === 'error'
             ? '运行环境异常'
-            : 'NapCat 正在启动';
+            : data.phase === 'resetting'
+              ? '正在重置登录状态'
+              : 'NapCat 正在启动';
       setQrPlaceholder(data.error || 'NapCat 启动中，请稍候…', true);
       return;
     }
@@ -989,7 +991,10 @@ async function pollQr() {
     if (data.qrcode && data.qrcode !== state.qr.current) {
       state.qr.current = data.qrcode;
       renderQr(data.qrcode);
+      return;
     }
+    // 还没出码：保持转圈并给出明确提示，而不是一直停在「正在连接 NapCat…」。
+    if (!data.qrcode) setQrPlaceholder('正在生成二维码…', true);
   } catch (error) {
     $('#qrStatus').textContent = '读取登录状态失败';
     setQrPlaceholder(error.message, false);
@@ -1015,9 +1020,14 @@ function renderQr(text) {
 async function refreshQr() {
   if (!state.qr.accountId) return;
   try {
-    await api(`/api/accounts/${state.qr.accountId}/qr`, { method: 'POST', timeout: 50000 });
+    const data = await api(`/api/accounts/${state.qr.accountId}/qr`, { method: 'POST', timeout: 50000 });
     state.qr.current = '';
-    toast('正在刷新二维码', 'info', 1400);
+    if (data && data.resetting) {
+      toast('旧登录已失效，正在重置登录状态并重新出码', 'info', 2600);
+      setQrPlaceholder('正在重置登录状态并重新生成二维码…', true);
+    } else {
+      toast('正在刷新二维码', 'info', 1400);
+    }
     await pollQr();
   } catch (error) {
     toast(`刷新失败：${error.message}`, 'error');

@@ -808,23 +808,30 @@ async function webuiPost(account, pathName, body = {}, timeout = 8000) {
 /** 二维码生成是阻塞式的：NapCat 要等 QQ 出图，启动初期可达几十秒，8 秒默认值等不到。 */
 const QRCODE_FETCH_TIMEOUT = 45000;
 
+/** 不同 NapCat 版本返回二维码的字段不一致，统一取出可用内容。 */
+function extractQrcode(data) {
+  if (!data) return '';
+  if (typeof data === 'string') return data;
+  return (
+    data.qrcode || data.qrcodeurl || data.qrcodeUrl || data.url || data.base64 || data.image || ''
+  );
+}
+
 async function getWebuiLoginState(account) {
   const status = await webuiPost(account, '/api/QQLogin/CheckLoginStatus');
   if (!status || status.code !== 0) {
     throw new Error((status && status.message) || '无法读取登录状态');
   }
   const data = status.data || {};
-  let qrcode = data.qrcodeurl || '';
+  let qrcode = extractQrcode(data);
   if (!data.isLogin && !qrcode) {
     const qr = await webuiPost(account, '/api/QQLogin/GetQQLoginQrcode', {}, QRCODE_FETCH_TIMEOUT);
-    if (qr && qr.code === 0 && qr.data) qrcode = qr.data.qrcode || '';
+    if (qr && qr.code === 0) qrcode = extractQrcode(qr.data);
     // 被踢下线的账号内核常卡在旧票据快速重登循环里，不进扫码阶段，
     // 被动取码一直为空；主动 Refresh 强制切回扫码阶段出码。
     if (!qrcode) {
       const refreshed = await webuiPost(account, '/api/QQLogin/RefreshQRcode', {}, QRCODE_FETCH_TIMEOUT);
-      if (refreshed && refreshed.code === 0 && refreshed.data) {
-        qrcode = refreshed.data.qrcodeurl || refreshed.data.qrcode || '';
-      }
+      if (refreshed && refreshed.code === 0) qrcode = extractQrcode(refreshed.data);
     }
   }
   let info = null;
@@ -846,11 +853,33 @@ async function getWebuiLoginState(account) {
   };
 }
 
+/**
+ * 强制回到扫码登录：清掉本地登录票据与登录态快照后再启动。
+ * 账号被踢下线后，QQ 内核会拿旧票据反复重登、永远不进扫码页，
+ * 此时只有丢掉旧票据才能让 QQ 重新生成二维码。
+ */
+async function resetLoginState(account) {
+  await stopAccount(account, { preserveDesired: true });
+  const dirs = accountDirs(account);
+  const { live, prev } = sessionBackupPaths(dirs);
+  // 旧快照同样是被踢的票据，必须一并清掉，否则下次启动又会被恢复。
+  fs.rmSync(live, { recursive: true, force: true });
+  fs.rmSync(prev, { recursive: true, force: true });
+  const stale = path.join(dirs.root, 'session-stale');
+  fs.rmSync(stale, { recursive: true, force: true });
+  try {
+    const src = sessionGlobalDir(dirs);
+    if (fs.existsSync(src)) fs.renameSync(src, stale);
+  } catch (_e) {
+    fs.rmSync(sessionGlobalDir(dirs), { recursive: true, force: true });
+  }
+  await sleep(600);
+  return startAccount(account);
+}
+
 async function refreshQrcode(account) {
   const result = await webuiPost(account, '/api/QQLogin/RefreshQRcode', {}, QRCODE_FETCH_TIMEOUT);
-  if (result && result.code === 0) {
-    return (result.data && (result.data.qrcodeurl || result.data.qrcode)) || '';
-  }
+  if (result && result.code === 0) return extractQrcode(result.data);
   return '';
 }
 
@@ -881,6 +910,7 @@ module.exports = {
   ensureAccountOnebotConfig,
   getWebuiLoginState,
   refreshQrcode,
+  resetLoginState,
   deleteAccountData,
   webuiLogin,
   probePort,
