@@ -13,7 +13,7 @@ const { Logger } = require('./lib/logger.cjs');
 const napcat = require('./lib/napcat.cjs');
 const { TaskEngine, TASK_KEYS, TASK_META } = require('./lib/tasks.cjs');
 
-const APP_VERSION = '2.0.21';
+const APP_VERSION = '2.0.22';
 const UPDATE_REPO = (process.env.QQNAS_UPDATE_REPO || 'qianliaa/qq-online').trim();
 const PORT = Number(process.env.PORT) || 8787;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -528,7 +528,10 @@ function refreshQrStateInBackground(account) {
  */
 const QR_EMPTY_ROUNDS_BEFORE_RESET = 3;
 const QR_RESET_TIMEOUT = 180 * 1000;
+/** 本次启动刚恢复过登录态时，给内核留出进扫码页的时间，避免重置把刚恢复的票据删掉。 */
+const QR_RESET_AFTER_RESTORE = 5 * 60 * 1000;
 const qrEmptyRounds = new Map();
+const qrResetDeferred = new Map();
 const qrResetting = new Set();
 
 function delay(ms) {
@@ -545,6 +548,20 @@ function trackQrProgress(account, webui) {
   if (startedAt && Date.now() - startedAt < 90 * 1000) return;
   // 之前登录过的账号有完整快照，交给保活用快照恢复，清票据反而会丢掉登录态。
   if (account.qq && napcat.hasGoodLogin(account)) return;
+  // 本次启动刚成功恢复过登录态：内核可能还没进扫码页，或取码接口暂时异常，
+  // 这期间自动重置会删掉刚落地的 nt_qq 票据，先跳过并记录一次。
+  const restoredAt = Number((account.loginRecovery && account.loginRecovery.restoredAt) || 0);
+  if (startedAt && restoredAt >= startedAt && Date.now() - restoredAt < QR_RESET_AFTER_RESTORE) {
+    if (qrResetDeferred.get(account.id) !== restoredAt) {
+      qrResetDeferred.set(account.id, restoredAt);
+      logger.warn('本次启动刚恢复登录态，暂缓自动重置（等待内核进入扫码页）', {
+        accountId: account.id,
+        account: account.alias,
+        restoredAt: new Date(restoredAt).toISOString(),
+      });
+    }
+    return;
+  }
   const rounds = (qrEmptyRounds.get(account.id) || 0) + 1;
   qrEmptyRounds.set(account.id, rounds);
   if (rounds >= QR_EMPTY_ROUNDS_BEFORE_RESET) resetAccountForQrcode(account);

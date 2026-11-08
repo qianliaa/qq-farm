@@ -798,11 +798,169 @@ async function startAccountUnlocked(account) {
 /* ------------------------------- 登录态保护 ------------------------------- */
 
 /**
- * QQ 登录态（设备信息、登录票据）保存在 ~/.config/QQ/nt_qq/global。
- * 停止前快照、启动时校验并恢复，确保各种重启都尽量保住登录状态。
+ * QQ(NT) 在本机的真实数据布局（真机日志实证）：
+ *   ~/.config/QQ/global                  全局数据，含 nt_data/mmkv
+ *   ~/.config/QQ/nt_qq_<32位hex>/        每个登录实例的数据，含 nt_data/mmkv
+ * 旧实现写死 ~/.config/QQ/nt_qq/global，这个目录在真机上并不存在，快照永远为空。
+ * 现在统一按“整体数据集”处理：global 与全部 nt_qq_* 一起快照、整体原子还原。
  */
-function sessionGlobalDir(dirs) {
-  return path.join(dirs.qqData, 'nt_qq', 'global');
+const QQ_DATASET_DIR_RE = /^nt_qq(_[0-9a-f]{32})?$/;
+/** 快照时间比当前数据最新写入时间新出这个阈值，才算“快照明显更新”。 */
+const SNAPSHOT_NEWER_MS = 60 * 1000;
+/** 刚用某份快照恢复过就不再重复覆盖的保护窗口。 */
+const RESTORE_COOLDOWN_MS = 30 * 60 * 1000;
+/** 快照复制前后各枚举一次，结构变化就整份重取，最多重试次数。 */
+const SNAPSHOT_CONSISTENCY_RETRIES = 3;
+
+/** 列出 QQ 数据根目录下参与登录态的数据入口：global 与全部 nt_qq_*（含旧版 nt_qq）。 */
+function listQqDatasetNames(root) {
+  const names = [];
+  try {
+    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name === 'global' || QQ_DATASET_DIR_RE.test(entry.name)) names.push(entry.name);
+    }
+  } catch (_e) {
+    return names;
+  }
+  names.sort();
+  return names;
+}
+
+/** 统计一个路径（文件或目录）的真实文件数与字节数，并取最新 mtime；空目录/空文件算无效。 */
+function inspectPathBytes(target, limit = 40) {
+  const result = { exists: false, files: 0, bytes: 0, newestAt: 0 };
+  let stat;
+  try {
+    stat = fs.statSync(target);
+  } catch (_e) {
+    return result;
+  }
+  result.exists = true;
+  if (stat.isFile()) {
+    result.files = 1;
+    result.bytes = stat.size;
+    result.newestAt = Math.round(stat.mtimeMs);
+    return result;
+  }
+  if (!stat.isDirectory()) return result;
+  const stack = [target];
+  while (stack.length && result.files < limit) {
+    const current = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch (_e) {
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        stack.push(path.join(current, entry.name));
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const full = path.join(current, entry.name);
+      result.files += 1;
+      try {
+        const info = fs.statSync(full);
+        result.bytes += info.size;
+        if (info.mtimeMs > result.newestAt) result.newestAt = Math.round(info.mtimeMs);
+      } catch (_e) {
+        /* ignore */
+      }
+      if (result.files >= limit) break;
+    }
+  }
+  return result;
+}
+
+/**
+ * 校验一份 QQ 数据集是否真的可用：global 与每个 nt_qq_* 的 nt_data/mmkv
+ * 都必须有真实文件/字节，而不是目录存在。登录票据在 nt_qq_* 里，
+ * 因此至少一个 nt_qq_* 的 mmkv 非空才算有效。
+ */
+function inspectQqDataSet(root) {
+  const names = listQqDatasetNames(root);
+  const ntNames = names.filter((name) => name !== 'global');
+  const globalState = inspectPathBytes(path.join(root, 'global', 'nt_data', 'mmkv'));
+  const ntStates = ntNames.map((name) => ({
+    name,
+    mmkv: inspectPathBytes(path.join(root, name, 'nt_data', 'mmkv')),
+  }));
+  const validNt = ntStates.filter((item) => item.mmkv.files > 0 && item.mmkv.bytes > 0);
+  let newestAt = globalState.newestAt;
+  for (const item of validNt) {
+    if (item.mmkv.newestAt > newestAt) newestAt = item.mmkv.newestAt;
+  }
+  return {
+    root,
+    names,
+    ntNames,
+    ntStates,
+    ntCount: ntNames.length,
+    validNtCount: validNt.length,
+    globalExists: globalState.exists,
+    globalValid: globalState.files > 0 && globalState.bytes > 0,
+    globalBytes: globalState.bytes,
+    newestAt,
+    valid: validNt.length > 0,
+  };
+}
+
+/**
+ * 识别一份快照/备份的结构：
+ * - dataset：含 nt_qq_* 子目录，是 2.0.22 起的整体快照；
+ * - global：只有 global 子目录（旧版 session-good 复制的是 <QQ>/nt_qq，即含 global）；
+ * - legacy-backup：根下直接是 global 的内容（旧版 session-backup 复制的是 <QQ>/nt_qq/global）。
+ */
+function inspectSnapshotDir(dir) {
+  const missing = { exists: false, kind: 'missing', names: [], entries: [], valid: false };
+  let exists = false;
+  try {
+    exists = fs.statSync(dir).isDirectory();
+  } catch (_e) {
+    return missing;
+  }
+  if (!exists) return missing;
+  const names = listQqDatasetNames(dir);
+  const ntNames = names.filter((name) => name !== 'global');
+  if (ntNames.length) {
+    const state = inspectQqDataSet(dir);
+    return {
+      exists: true,
+      kind: 'dataset',
+      names,
+      entries: names,
+      state,
+      newestAt: state.newestAt,
+      valid: state.valid,
+    };
+  }
+  if (names.includes('global')) {
+    const left = inspectPathBytes(path.join(dir, 'global'));
+    return {
+      exists: true,
+      kind: 'global',
+      names,
+      entries: names,
+      files: left.files,
+      bytes: left.bytes,
+      newestAt: left.newestAt,
+      valid: left.files > 0 && left.bytes > 0,
+    };
+  }
+  const legacyMmkv = inspectPathBytes(path.join(dir, 'nt_data', 'mmkv'));
+  const legacyAny = legacyMmkv.exists ? legacyMmkv : inspectPathBytes(dir);
+  return {
+    exists: true,
+    kind: 'legacy-backup',
+    names: [],
+    entries: [],
+    files: legacyAny.files,
+    bytes: legacyAny.bytes,
+    newestAt: legacyAny.newestAt,
+    valid: legacyAny.files > 0 && legacyAny.bytes > 0,
+  };
 }
 
 function sessionBackupPaths(dirs) {
@@ -837,62 +995,8 @@ function writeSnapshotMeta(dir, meta) {
   }
 }
 
-/** 以有限深度统计目录中的普通文件数与字节数，用于判断快照是否“非空可用”。 */
-function inspectDir(dir, limit = 50) {
-  const result = { exists: false, files: 0, bytes: 0 };
-  try {
-    if (!fs.statSync(dir).isDirectory()) return result;
-  } catch (_e) {
-    return result;
-  }
-  result.exists = true;
-  const stack = [dir];
-  while (stack.length && result.files < limit) {
-    const current = stack.pop();
-    let entries;
-    try {
-      entries = fs.readdirSync(current, { withFileTypes: true });
-    } catch (_e) {
-      continue;
-    }
-    for (const entry of entries) {
-      const full = path.join(current, entry.name);
-      if (entry.isDirectory()) {
-        stack.push(full);
-      } else if (entry.isFile()) {
-        result.files += 1;
-        try {
-          result.bytes += fs.statSync(full).size;
-        } catch (_e) {
-          /* ignore */
-        }
-        if (result.files >= limit) break;
-      }
-    }
-  }
-  return result;
-}
-
-/** 完整 nt_qq 快照必须包含非空的 global 子目录。 */
-function inspectNtSnapshot(dir) {
-  const base = inspectDir(dir, 1);
-  if (!base.exists) return { ...base, valid: false };
-  const global = inspectDir(path.join(dir, 'global'));
-  return {
-    ...base,
-    globalFiles: global.files,
-    globalBytes: global.bytes,
-    valid: base.exists && global.files > 0 && global.bytes > 0,
-  };
-}
-
-function inspectGlobalSnapshot(dir) {
-  const info = inspectDir(dir);
-  return { ...info, valid: info.exists && info.files > 0 && info.bytes > 0 };
-}
-
-async function describeSnapshot(dir, fullNt) {
-  const inspection = fullNt ? inspectNtSnapshot(dir) : inspectGlobalSnapshot(dir);
+async function describeSnapshot(dir) {
+  const inspection = inspectSnapshotDir(dir);
   const meta = readSnapshotMeta(dir);
   let byteSize = Number(meta && meta.size) || 0;
   if (!byteSize && inspection.exists) byteSize = await measureDirSize(dir);
@@ -904,9 +1008,7 @@ async function describeSnapshot(dir, fullNt) {
   }
   return {
     path: dir,
-    exists: inspection.exists,
-    valid: inspection.valid,
-    files: inspection.files,
+    ...inspection,
     size: byteSize,
     verifiedAt: Number(meta && (meta.verifiedAt || meta.createdAt)) || mtime,
     meta,
@@ -964,14 +1066,29 @@ async function replaceDirAtomically(src, target, validator) {
 
 const RECOVERY_DEFAULTS = {
   at: 0,
+  phase: '',
+  restoredAt: 0,
   snapshotFound: false,
   snapshotAt: 0,
   snapshotSize: 0,
   snapshotSource: '',
+  snapshotFormat: '',
+  datasetEntries: [],
+  currentValid: false,
+  currentNewestAt: 0,
+  ntCount: 0,
+  globalValid: false,
+  globalBytes: 0,
+  goodCount: 0,
+  backupCount: 0,
+  goodVerifiedAt: 0,
+  decision: '',
   restoreAttempted: false,
   restoreResult: '',
   restoreAction: '',
   webuiIsLogin: null,
+  lastRestoredGoodAt: 0,
+  lastRestoredSnapshotAt: 0,
   error: '',
 };
 
@@ -980,14 +1097,27 @@ function noteRecovery(account, patch = {}) {
   account.loginRecovery = { ...RECOVERY_DEFAULTS, ...(account.loginRecovery || {}), ...data, at: Date.now() };
   if (!silent) {
     const record = account.loginRecovery;
+    const iso = (value) => (value ? new Date(value).toISOString() : '');
     appendAccountLog(
       account,
       `登录态诊断 ${JSON.stringify({
         phase: record.phase || '',
         snapshotFound: record.snapshotFound,
-        snapshotAt: record.snapshotAt ? new Date(record.snapshotAt).toISOString() : '',
+        snapshotFormat: record.snapshotFormat || '',
+        snapshotAt: iso(record.snapshotAt),
         snapshotSize: record.snapshotSize,
         snapshotSource: record.snapshotSource,
+        datasetEntries: record.datasetEntries || [],
+        currentValid: Boolean(record.currentValid),
+        currentNewestAt: iso(record.currentNewestAt),
+        ntCount: Number(record.ntCount) || 0,
+        globalValid: Boolean(record.globalValid),
+        globalBytes: Number(record.globalBytes) || 0,
+        goodCount: Number(record.goodCount) || 0,
+        backupCount: Number(record.backupCount) || 0,
+        goodVerifiedAt: iso(record.goodVerifiedAt),
+        decision: record.decision || '',
+        restoredAt: iso(record.restoredAt),
         restoreAttempted: record.restoreAttempted,
         restoreAction: record.restoreAction,
         restoreResult: record.restoreResult,
@@ -999,14 +1129,19 @@ function noteRecovery(account, patch = {}) {
   return account.loginRecovery;
 }
 
-/** 停止前快照登录态，滚动保留最近两份。 */
+/** 停止前把整份 QQ 数据（global + 全部 nt_qq_*）备份，滚动保留最近两份。 */
 async function backupSessionState(dirs) {
-  const src = sessionGlobalDir(dirs);
-  if (!inspectGlobalSnapshot(src).valid) return false;
+  const qqRoot = dirs.qqData;
+  const current = inspectQqDataSet(qqRoot);
+  if (!current.valid) return false;
   const { staging, live, prev } = sessionBackupPaths(dirs);
   try {
     fs.rmSync(staging, { recursive: true, force: true });
-    await runCommand('cp', ['-a', src, staging]);
+    fs.mkdirSync(staging, { recursive: true });
+    for (const name of current.names) {
+      await copyDir(path.join(qqRoot, name), path.join(staging, name));
+    }
+    if (!inspectQqDataSet(staging).valid) throw new Error('备份复制后校验失败');
     if (fs.existsSync(live)) {
       fs.rmSync(prev, { recursive: true, force: true });
       fs.renameSync(live, prev);
@@ -1019,118 +1154,220 @@ async function backupSessionState(dirs) {
   }
 }
 
-/** 启动前校验登录态：目录存在但关键文件为空/缺失时也算不可用并恢复。 */
+/** 启动前校验登录态：目录存在但 mmkv 为空/缺失也算不可用并恢复。 */
 async function restoreSessionStateIfMissing(account) {
   return withAccountLock(account, () => restoreSessionStateIfMissingUnlocked(account, accountDirs(account)));
 }
 
+/** 把当前 QQ 数据整体挪走（重置登录态用），返回移动的目录数。 */
+function moveQqDataSet(sourceRoot, targetDir) {
+  fs.rmSync(targetDir, { recursive: true, force: true });
+  fs.mkdirSync(targetDir, { recursive: true });
+  let moved = 0;
+  for (const name of listQqDatasetNames(sourceRoot)) {
+    try {
+      fs.renameSync(path.join(sourceRoot, name), path.join(targetDir, name));
+      moved += 1;
+    } catch (_e) {
+      fs.rmSync(path.join(sourceRoot, name), { recursive: true, force: true });
+    }
+  }
+  return moved;
+}
+
+/** 整体原子还原：复制到 .restore-* -> 校验 -> 旧数据挪到 .old-* -> 新数据就位，失败回滚。 */
+async function applyDatasetSnapshot(snapshotDir, qqRoot) {
+  const names = listQqDatasetNames(snapshotDir);
+  if (!names.length) throw new Error('快照中没有可还原的数据目录');
+  const suffix = crypto.randomBytes(6).toString('hex');
+  const temp = path.join(qqRoot, `.restore-${suffix}`);
+  const aside = path.join(qqRoot, `.old-${suffix}`);
+  fs.mkdirSync(qqRoot, { recursive: true });
+  fs.rmSync(temp, { recursive: true, force: true });
+  fs.rmSync(aside, { recursive: true, force: true });
+  try {
+    fs.mkdirSync(temp, { recursive: true });
+    for (const name of names) {
+      await copyDir(path.join(snapshotDir, name), path.join(temp, name));
+    }
+    if (!inspectQqDataSet(temp).valid) throw new Error('复制后的快照校验失败：缺少可用的 nt_data/mmkv');
+    fs.mkdirSync(aside, { recursive: true });
+    const moved = [];
+    for (const name of listQqDatasetNames(qqRoot)) {
+      try {
+        fs.renameSync(path.join(qqRoot, name), path.join(aside, name));
+        moved.push(name);
+      } catch (_e) {
+        /* 旧目录可能已被并发清理，忽略 */
+      }
+    }
+    const placed = [];
+    try {
+      for (const name of names) {
+        fs.renameSync(path.join(temp, name), path.join(qqRoot, name));
+        placed.push(name);
+      }
+    } catch (err) {
+      for (const name of placed) fs.rmSync(path.join(qqRoot, name), { recursive: true, force: true });
+      for (const name of moved) {
+        try {
+          fs.renameSync(path.join(aside, name), path.join(qqRoot, name));
+        } catch (_e) {
+          /* 回滚失败时保留 .old-* 供人工找回 */
+        }
+      }
+      throw err;
+    }
+    fs.rmSync(aside, { recursive: true, force: true });
+    fs.rmSync(temp, { recursive: true, force: true });
+    return true;
+  } catch (err) {
+    fs.rmSync(temp, { recursive: true, force: true });
+    throw err;
+  }
+}
+
+/** 旧格式快照只带 global 时，只还原 global 子目录。 */
+async function applyGlobalSnapshot(report, qqRoot) {
+  const source = report.kind === 'global' ? path.join(report.path, 'global') : report.path;
+  const target = path.join(qqRoot, 'global');
+  await replaceDirAtomically(source, target, (dir) => {
+    const info = inspectPathBytes(dir);
+    return info.files > 0 && info.bytes > 0;
+  });
+}
+
 async function restoreSessionStateIfMissingUnlocked(account, dirs) {
-  const ntDir = path.join(dirs.qqData, 'nt_qq');
-  const global = sessionGlobalDir(dirs);
-  const ntState = inspectNtSnapshot(ntDir);
-  const globalState = inspectGlobalSnapshot(global);
+  const qqRoot = dirs.qqData;
+  const current = inspectQqDataSet(qqRoot);
   const goodPaths = goodSessionPaths(dirs);
-  const goods = [
+  const backupPaths = sessionBackupPaths(dirs);
+  const goodReports = [];
+  for (const [name, dir] of [
     ['session-good', goodPaths.live],
     ['session-good.prev', goodPaths.prev],
-  ];
-  const backupPaths = sessionBackupPaths(dirs);
-  const backups = [
-    ['session-backup', backupPaths.live],
-    ['session-backup.prev', backupPaths.prev],
-  ];
-  const goodReports = [];
-  for (const [name, dir] of goods) {
-    const report = await describeSnapshot(dir, true);
+  ]) {
+    const report = await describeSnapshot(dir);
     if (report.valid) goodReports.push({ name, ...report });
   }
   const backupReports = [];
-  for (const [name, dir] of backups) {
-    const report = await describeSnapshot(dir, false);
+  for (const [name, dir] of [
+    ['session-backup', backupPaths.live],
+    ['session-backup.prev', backupPaths.prev],
+  ]) {
+    const report = await describeSnapshot(dir);
     if (report.valid) backupReports.push({ name, ...report });
   }
-  const bestGood = goodReports[0];
+  const bestGood = goodReports[0] || null;
   const baseRecord = {
     phase: 'startup',
     snapshotFound: goodReports.length > 0,
+    snapshotFormat: bestGood ? bestGood.kind : '',
     snapshotAt: bestGood ? bestGood.verifiedAt : 0,
     snapshotSize: bestGood ? bestGood.size : 0,
     snapshotSource: bestGood ? bestGood.name : '',
-    ntNtExists: ntState.exists,
-    ntNtValid: ntState.valid,
-    globalExists: globalState.exists,
-    globalValid: globalState.valid,
-    goodSnapshotFound: goodReports.length > 0,
-    globalBackupFound: backupReports.length > 0,
+    datasetEntries: current.names,
+    currentValid: current.valid,
+    currentNewestAt: current.newestAt,
+    ntCount: current.ntCount,
+    globalValid: current.globalValid,
+    globalBytes: current.globalBytes,
+    goodCount: goodReports.length,
+    backupCount: backupReports.length,
+    goodVerifiedAt: bestGood ? bestGood.verifiedAt : 0,
   };
 
-  if (!ntState.valid) {
-    for (const report of goodReports) {
+  // 判定依据（不偷偷决定，全部写进诊断行）：
+  // 1. 当前数据没有可用的 nt_data/mmkv -> 必须用快照；
+  // 2. 当前可用，但 good 快照 verifiedAt 明显新于当前最新写入 -> 以快照为准；
+  // 3. 其余情况保留当前数据，避免把刚被 QQ 更新的票据又覆盖回旧快照。
+  const previous = account.loginRecovery || {};
+  const lastRestoredGoodAt = Number(previous.lastRestoredGoodAt) || 0;
+  const lastRestoredSnapshotAt = Number(previous.lastRestoredSnapshotAt) || 0;
+
+  let decision = 'current-valid';
+  let candidates = [];
+  if (!current.valid) {
+    decision = 'current-invalid';
+    candidates = [...goodReports, ...backupReports];
+  } else if (
+    bestGood &&
+    bestGood.kind === 'dataset' &&
+    Number(bestGood.verifiedAt) > Number(current.newestAt) + SNAPSHOT_NEWER_MS
+  ) {
+    if (
+      lastRestoredSnapshotAt === bestGood.verifiedAt &&
+      Date.now() - lastRestoredGoodAt < RESTORE_COOLDOWN_MS
+    ) {
+      decision = 'skip-recently-restored';
+    } else {
+      decision = 'snapshot-newer';
+      candidates = goodReports;
+    }
+  }
+
+  if (candidates.length) {
+    let lastError = '';
+    let attempted = false;
+    for (const report of candidates) {
+      attempted = true;
+      const action = report.kind === 'dataset' ? 'restore-qq-dataset' : 'restore-global';
       try {
-        await replaceDirAtomically(report.path, ntDir, (dir) => inspectNtSnapshot(dir).valid);
+        if (report.kind === 'dataset') await applyDatasetSnapshot(report.path, qqRoot);
+        else await applyGlobalSnapshot(report, qqRoot);
         noteRecovery(account, {
           ...baseRecord,
           snapshotFound: true,
+          snapshotFormat: report.kind,
           snapshotAt: report.verifiedAt,
           snapshotSize: report.size,
           snapshotSource: report.name,
+          decision,
           restoreAttempted: true,
-          restoreAction: 'restore-nt_qq',
+          restoreAction: action,
           restoreResult: 'success',
+          restoredAt: Date.now(),
+          lastRestoredGoodAt: Date.now(),
+          lastRestoredSnapshotAt: report.verifiedAt,
           error: '',
         });
         return true;
       } catch (err) {
+        lastError = err.message;
         noteRecovery(account, {
           ...baseRecord,
           snapshotFound: true,
+          snapshotFormat: report.kind,
           snapshotAt: report.verifiedAt,
           snapshotSize: report.size,
           snapshotSource: report.name,
+          decision,
           restoreAttempted: true,
-          restoreAction: 'restore-nt_qq',
+          restoreAction: action,
           restoreResult: 'failed',
           error: err.message,
         });
       }
     }
-  }
-
-  if (!globalState.valid) {
-    for (const report of backupReports) {
-      try {
-        await replaceDirAtomically(report.path, global, (dir) => inspectGlobalSnapshot(dir).valid);
-        noteRecovery(account, {
-          ...baseRecord,
-          snapshotSource: report.name,
-          snapshotAt: report.verifiedAt,
-          snapshotSize: report.size,
-          restoreAttempted: true,
-          restoreAction: 'restore-global',
-          restoreResult: 'success',
-          error: '',
-        });
-        return true;
-      } catch (err) {
-        noteRecovery(account, {
-          ...baseRecord,
-          snapshotSource: report.name,
-          snapshotAt: report.verifiedAt,
-          snapshotSize: report.size,
-          restoreAttempted: true,
-          restoreAction: 'restore-global',
-          restoreResult: 'failed',
-          error: err.message,
-        });
-      }
+    if (attempted) {
+      noteRecovery(account, {
+        ...baseRecord,
+        decision,
+        restoreAttempted: true,
+        restoreAction: 'none',
+        restoreResult: 'failed',
+        error: lastError || '快照恢复失败',
+      });
+      return false;
     }
   }
 
   noteRecovery(account, {
     ...baseRecord,
+    decision,
     restoreAttempted: false,
     restoreAction: 'none',
-    restoreResult: ntState.valid ? 'existing-nt_qq' : 'no-valid-snapshot',
+    restoreResult: current.valid ? 'existing-data' : 'no-valid-snapshot',
     error: '',
   });
   return false;
@@ -1145,7 +1382,7 @@ async function snapshotGoodLogin(account, options = {}) {
 /** 只有 WebUI 权威确认 isLogin=true 时才做完整快照，未验证的数据绝不覆盖旧 good。 */
 async function snapshotGoodLoginUnlocked(account, { verified = false, uin = '' } = {}) {
   const dirs = accountDirs(account);
-  const src = path.join(dirs.qqData, 'nt_qq');
+  const qqRoot = dirs.qqData;
   const paths = goodSessionPaths(dirs);
   if (!verified) {
     noteRecovery(account, {
@@ -1160,25 +1397,55 @@ async function snapshotGoodLoginUnlocked(account, { verified = false, uin = '' }
     });
     return false;
   }
-  const sourceState = inspectNtSnapshot(src);
-  if (!sourceState.valid) {
+  const current = inspectQqDataSet(qqRoot);
+  if (!current.valid) {
     noteRecovery(account, {
       phase: 'snapshot',
       snapshotFound: false,
       snapshotAt: 0,
       snapshotSize: 0,
+      datasetEntries: current.names,
+      currentValid: false,
+      currentNewestAt: current.newestAt,
+      ntCount: current.ntCount,
+      globalValid: current.globalValid,
+      globalBytes: current.globalBytes,
       restoreAction: 'snapshot-skip',
       restoreResult: 'failed',
       webuiIsLogin: true,
-      error: '当前 nt_qq 缺少可用 global 数据，未生成快照',
+      error: '当前 QQ 数据缺少可用的 nt_qq_*/nt_data/mmkv，未生成快照',
     });
     return false;
   }
   const staging = `${paths.live}.${crypto.randomBytes(6).toString('hex')}.new`;
   try {
-    fs.rmSync(staging, { recursive: true, force: true });
-    await copyDir(src, staging);
-    if (!inspectNtSnapshot(staging).valid) throw new Error('快照复制后校验失败');
+    let snapshotEntries = null;
+    for (let attempt = 1; attempt <= SNAPSHOT_CONSISTENCY_RETRIES; attempt += 1) {
+      const before = listQqDatasetNames(qqRoot);
+      fs.rmSync(staging, { recursive: true, force: true });
+      fs.mkdirSync(staging, { recursive: true });
+      for (const name of before) {
+        await copyDir(path.join(qqRoot, name), path.join(staging, name));
+      }
+      // 运行中的账号可能新增或替换 nt_qq_*；复制前后枚举必须一致，否则整份重取。
+      const after = listQqDatasetNames(qqRoot);
+      if (before.join('|') !== after.join('|')) {
+        fs.rmSync(staging, { recursive: true, force: true });
+        appendAccountLog(
+          account,
+          `快照一致性检查：第 ${attempt} 次复制前后数据目录不一致（${before.join(',')} -> ${after.join(',')}），重试`
+        );
+        continue;
+      }
+      if (!inspectQqDataSet(staging).valid) {
+        throw new Error('快照复制后校验失败：缺少可用的 nt_data/mmkv');
+      }
+      snapshotEntries = before;
+      break;
+    }
+    if (!snapshotEntries) {
+      throw new Error(`快照期间 QQ 数据目录持续变化（已重试 ${SNAPSHOT_CONSISTENCY_RETRIES} 次）`);
+    }
     const size = await measureDirSize(staging);
     let rotated = false;
     if (fs.existsSync(paths.live)) {
@@ -1203,19 +1470,27 @@ async function snapshotGoodLoginUnlocked(account, { verified = false, uin = '' }
     }
     const verifiedAt = Date.now();
     writeSnapshotMeta(paths.live, {
-      version: 1,
+      version: 2,
       uin: String(uin || account.qq || ''),
       verifiedAt,
       createdAt: verifiedAt,
       size,
       source: 'webui',
+      entries: snapshotEntries,
     });
     noteRecovery(account, {
       phase: 'snapshot',
       snapshotFound: true,
+      snapshotFormat: 'dataset',
       snapshotAt: verifiedAt,
       snapshotSize: size,
       snapshotSource: 'session-good',
+      datasetEntries: snapshotEntries,
+      currentValid: true,
+      currentNewestAt: current.newestAt,
+      ntCount: current.ntCount,
+      globalValid: current.globalValid,
+      globalBytes: current.globalBytes,
       restoreAttempted: true,
       restoreAction: 'snapshot-good',
       restoreResult: 'success',
@@ -1242,7 +1517,7 @@ async function snapshotGoodLoginUnlocked(account, { verified = false, uin = '' }
 
 function hasGoodLogin(account) {
   const paths = goodSessionPaths(accountDirs(account));
-  return inspectNtSnapshot(paths.live).valid || inspectNtSnapshot(paths.prev).valid;
+  return inspectSnapshotDir(paths.live).valid || inspectSnapshotDir(paths.prev).valid;
 }
 
 /** 用登录快照覆盖 QQ 数据后重启；当前数据先复制校验，失败不动原目录，可用上一代回退。 */
@@ -1258,7 +1533,7 @@ async function restoreGoodLoginUnlocked(account) {
     ['session-good', paths.live],
     ['session-good.prev', paths.prev],
   ]) {
-    const report = await describeSnapshot(dir, true);
+    const report = await describeSnapshot(dir);
     if (report.valid) candidates.push({ name, ...report });
   }
   if (!candidates.length) {
@@ -1276,6 +1551,7 @@ async function restoreGoodLoginUnlocked(account) {
   noteRecovery(account, {
     phase: 'restore',
     snapshotFound: true,
+    snapshotFormat: source.kind,
     snapshotAt: source.verifiedAt,
     snapshotSize: source.size,
     snapshotSource: source.name,
@@ -1285,20 +1561,25 @@ async function restoreGoodLoginUnlocked(account) {
     error: '',
   });
   await stopAccountUnlocked(account, { preserveDesired: true, snapshotGood: false });
-  const target = path.join(dirs.qqData, 'nt_qq');
+  const qqRoot = dirs.qqData;
   let lastError = null;
   for (const candidate of candidates) {
     try {
-      await replaceDirAtomically(candidate.path, target, (dir) => inspectNtSnapshot(dir).valid);
+      if (candidate.kind === 'dataset') await applyDatasetSnapshot(candidate.path, qqRoot);
+      else await applyGlobalSnapshot(candidate, qqRoot);
       noteRecovery(account, {
         phase: 'restore',
         snapshotFound: true,
+        snapshotFormat: candidate.kind,
         snapshotAt: candidate.verifiedAt,
         snapshotSize: candidate.size,
         snapshotSource: candidate.name,
         restoreAttempted: true,
         restoreAction: 'restore-good',
         restoreResult: 'success',
+        restoredAt: Date.now(),
+        lastRestoredGoodAt: Date.now(),
+        lastRestoredSnapshotAt: candidate.verifiedAt,
         error: '',
       });
       return startAccountUnlocked(account);
@@ -1307,6 +1588,7 @@ async function restoreGoodLoginUnlocked(account) {
       noteRecovery(account, {
         phase: 'restore',
         snapshotFound: true,
+        snapshotFormat: candidate.kind,
         snapshotAt: candidate.verifiedAt,
         snapshotSize: candidate.size,
         snapshotSource: candidate.name,
@@ -1603,27 +1885,56 @@ async function resetLoginState(account) {
     const dirs = accountDirs(account);
     const backupPaths = sessionBackupPaths(dirs);
     const goodPaths = goodSessionPaths(dirs);
-    // 旧快照同样是被踢的票据，必须一并清掉，否则下次启动又会被恢复。
-    fs.rmSync(backupPaths.live, { recursive: true, force: true });
-    fs.rmSync(backupPaths.prev, { recursive: true, force: true });
+    // 旧快照不再直接删除：先归档到 session-reset-<时间戳>/（只留最近一份），
+    // 这样即使重置判断错误，也还能人工找回刚恢复的登录态。
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const archive = path.join(dirs.root, `session-reset-${stamp}`);
+    const keep = [
+      ['session-backup', backupPaths.live],
+      ['session-backup.prev', backupPaths.prev],
+      ['session-good', goodPaths.live],
+      ['session-good.prev', goodPaths.prev],
+      ['session-good.meta.json', goodPaths.liveMeta],
+      ['session-good.prev.meta.json', goodPaths.prevMeta],
+    ];
+    let archived = 0;
+    for (const [name, dir] of keep) {
+      if (!fs.existsSync(dir)) continue;
+      try {
+        fs.mkdirSync(archive, { recursive: true });
+        fs.renameSync(dir, path.join(archive, name));
+        archived += 1;
+      } catch (_e) {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    }
     fs.rmSync(backupPaths.staging, { recursive: true, force: true });
-    fs.rmSync(goodPaths.live, { recursive: true, force: true });
-    fs.rmSync(goodPaths.prev, { recursive: true, force: true });
-    fs.rmSync(goodPaths.liveMeta, { force: true });
-    fs.rmSync(goodPaths.prevMeta, { force: true });
-    const stale = path.join(dirs.root, 'session-stale');
-    fs.rmSync(stale, { recursive: true, force: true });
+    // 只保留最近一次重置的归档，避免快照长期堆积占空间。
     try {
-      const src = sessionGlobalDir(dirs);
-      if (fs.existsSync(src)) fs.renameSync(src, stale);
+      for (const entry of fs.readdirSync(dirs.root)) {
+        if (!entry.startsWith('session-reset-')) continue;
+        const full = path.join(dirs.root, entry);
+        if (full === archive) continue;
+        fs.rmSync(full, { recursive: true, force: true });
+      }
     } catch (_e) {
-      fs.rmSync(sessionGlobalDir(dirs), { recursive: true, force: true });
+      /* ignore */
+    }
+    if (archived) appendAccountLog(account, `重置登录态：旧快照已归档到 ${path.basename(archive)}（${archived} 项）`);
+    const stale = path.join(dirs.root, 'session-stale');
+    // 旧票据可能分布在 global 与多个 nt_qq_* 里，整份挪走而不是只处理某一个目录。
+    const moved = moveQqDataSet(dirs.qqData, stale);
+    if (moved) {
+      appendAccountLog(account, `重置登录态：已把 ${moved} 个 QQ 数据目录（global/nt_qq_*）移到 session-stale`);
     }
     noteRecovery(account, {
       phase: 'reset',
       snapshotFound: false,
       snapshotAt: 0,
       snapshotSize: 0,
+      datasetEntries: [],
+      currentValid: false,
+      decision: 'reset',
       restoreAttempted: true,
       restoreAction: 'reset-login',
       restoreResult: 'success',
