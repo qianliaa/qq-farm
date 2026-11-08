@@ -1,4 +1,5 @@
 :root {
+  color-scheme: dark;
   --bg: #060a10;
   --bg-2: #0a111a;
   --panel: #0f1722;
@@ -1413,24 +1414,70 @@ svg {
   color: #b7c6d6;
 }
 
-.field input {
+.field input,
+.field select {
   height: 38px;
   padding: 0 12px;
   border-radius: 10px;
   border: 1px solid #223246;
-  background: #0a121b;
+  background-color: #0a121b;
+  color: var(--text);
   outline: none;
   font-size: 13px;
   transition: border-color 0.16s ease, box-shadow 0.16s ease;
 }
 
-.field input:focus {
+.field input:focus,
+.field select:focus {
   border-color: rgba(18, 183, 245, 0.55);
   box-shadow: 0 0 0 3px rgba(18, 183, 245, 0.1);
 }
 
 .field input::placeholder {
   color: #46586d;
+}
+
+/* 原生下拉框：暗色底色 + 自绘箭头，并保证展开后的 option 可读 */
+.field select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 30px;
+  cursor: pointer;
+  background-image: linear-gradient(45deg, transparent 50%, #6d8197 50%),
+    linear-gradient(135deg, #6d8197 50%, transparent 50%);
+  background-position: calc(100% - 16px) calc(50% - 2px), calc(100% - 11px) calc(50% - 2px);
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
+
+.field select option {
+  background-color: #0a121b;
+  color: var(--text);
+}
+
+.field select option:checked {
+  background-color: #12354d;
+  color: var(--text);
+}
+
+.field input:disabled,
+.field select:disabled {
+  color: var(--muted);
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+/* 复选框/单选框不套用输入框的尺寸与边框，避免在暗色面板里出现拉伸的白块 */
+.field input[type="checkbox"],
+.field input[type="radio"] {
+  width: 13px;
+  height: 13px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  accent-color: var(--accent);
+  flex: none;
 }
 
 .field small {

@@ -16,7 +16,7 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -32,34 +32,41 @@ jobs:
       - name: Build fpk
         run: python3 fnos-fpk/build-fpk.py
 
-      - name: Resolve version
-        id: version
+      - name: Resolve package info
+        id: pkg
         run: |
           set -euo pipefail
           version=$(sed -n 's/^version[[:space:]]*=[[:space:]]*//p' fnos-fpk/fpk-src/manifest | head -n1 | tr -d '\r')
+          [ -n "$version" ] || { echo "manifest 缺少 version"; exit 1; }
+          file="fnos-fpk/dist/qqnas_${version}_all.fpk"
+          test -f "$file" || { echo "未生成 $file"; exit 1; }
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=v$version" >> "$GITHUB_OUTPUT"
-          fi
-          test -f "fnos-fpk/dist/qqnas_${version}_all.fpk"
+          echo "file=$file" >> "$GITHUB_OUTPUT"
 
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qqnas-${{ steps.pkg.outputs.version }}-all
+          path: ${{ steps.pkg.outputs.file }}
+          if-no-files-found: error
+
+      # 只有打 tag 时才发布 Release；普通 push 仅产出 workflow artifact。
       - name: Publish release
+        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.version }}
-          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.pkg.outputs.version }}
+          FILE: ${{ steps.pkg.outputs.file }}
+          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          file="fnos-fpk/dist/qqnas_${VERSION}_all.fpk"
-          sha=$(sha256sum "$file" | cut -d' ' -f1)
+          sha=$(sha256sum "$FILE" | cut -d' ' -f1)
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             {
               echo "## QQ 挂机仓 ${VERSION}"
               echo
               echo "- 使用飞牛原生 Node.js 22 运行时，不依赖 Docker"
-              echo "- 安装包见下方 Assets 中的 \`$(basename "$file")\`"
+              echo "- 安装包见下方 Assets 中的 \`$(basename "$FILE")\`"
               echo
               echo "构建提交：${GITHUB_SHA}"
               echo
@@ -67,4 +74,4 @@ jobs:
             } > /tmp/release-notes.md
             gh release create "$TAG" --title "QQ 挂机仓 ${VERSION}" --notes-file /tmp/release-notes.md
           fi
-          gh release upload "$TAG" "$file" --clobber
+          gh release upload "$TAG" "$FILE" --clobber

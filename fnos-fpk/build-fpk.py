@@ -170,6 +170,49 @@ def write_tar_gz(output: Path, base: Path, executable: set[str] | None = None) -
     output.write_bytes(buffer.getvalue())
 
 
+OUTER_EXECUTABLES = {
+    "cmd/main",
+    "cmd/install_init",
+    "cmd/install_callback",
+    "cmd/upgrade_init",
+    "cmd/upgrade_callback",
+    "cmd/uninstall_init",
+    "cmd/uninstall_callback",
+    "cmd/config_init",
+    "cmd/config_callback",
+}
+
+
+def read_tar_entries(path: Path) -> dict[str, tarfile.TarInfo]:
+    with tarfile.open(str(path), "r:gz") as tar:
+        return {info.name: info for info in tar.getmembers()}
+
+
+def verify_package(output: Path, app_tgz: Path) -> None:
+    """复核外层与内层 tar：权限位、uid/gid 与关键文件必须符合 Linux 安装要求。"""
+    outer = read_tar_entries(output)
+    if "app.tgz" not in outer:
+        fail("fpk 缺少 app.tgz")
+    for name, info in outer.items():
+        if info.uid != 0 or info.gid != 0:
+            fail(f"fpk 条目 {name} 的 uid/gid 不是 0")
+        expected = 0o755 if (info.isdir() or name in OUTER_EXECUTABLES) else 0o644
+        if info.mode != expected:
+            fail(f"fpk 条目 {name} 权限为 {oct(info.mode)}，应为 {oct(expected)}")
+
+    inner = read_tar_entries(app_tgz)
+    for rel in ["manager/server.cjs", "manager/lib/napcat.cjs", "runtime/napcat-install.sh"]:
+        if rel not in inner:
+            fail(f"app.tgz 缺少 {rel}")
+    for name, info in inner.items():
+        if info.uid != 0 or info.gid != 0:
+            fail(f"app.tgz 条目 {name} 的 uid/gid 不是 0")
+        expected = 0o755 if (info.isdir() or name == "runtime/napcat-install.sh") else 0o644
+        if info.mode != expected:
+            fail(f"app.tgz 条目 {name} 权限为 {oct(info.mode)}，应为 {oct(expected)}")
+    print("打包校验通过：权限 755/644、uid/gid=0，关键文件齐全")
+
+
 def main() -> None:
     manifest = validate()
 
@@ -204,21 +247,8 @@ def main() -> None:
     version = manifest["version"]
     platform = manifest["platform"]
     output = DIST / f"qqnas_{version}_{platform}.fpk"
-    write_tar_gz(
-        output,
-        fpk_root,
-        executable={
-            "cmd/main",
-            "cmd/install_init",
-            "cmd/install_callback",
-            "cmd/upgrade_init",
-            "cmd/upgrade_callback",
-            "cmd/uninstall_init",
-            "cmd/uninstall_callback",
-            "cmd/config_init",
-            "cmd/config_callback",
-        },
-    )
+    write_tar_gz(output, fpk_root, executable=OUTER_EXECUTABLES)
+    verify_package(output, app_tgz)
 
     size_mb = output.stat().st_size / 1024 / 1024
     print(f"已生成：{output}（{size_mb:.2f} MB）")
