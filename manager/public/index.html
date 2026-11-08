@@ -327,9 +327,9 @@
         </div>
         <div class="field span-2" id="userManageBox">
           <span>用户管理（飞牛用户间隔离）</span>
-          <small>每个用户只看到并管理自己的 QQ 账号；把用户名和初始密码告诉对应的飞牛用户即可。</small>
+          <small id="userManageHint">每个用户只看到并管理自己的 QQ 账号。</small>
           <div id="userList"></div>
-          <div class="runtime-setting-actions">
+          <div class="runtime-setting-actions" id="userAddRow">
             <input id="newUserName" type="text" placeholder="用户名" style="flex:1;min-width:0">
             <input id="newUserPassword" type="password" placeholder="初始密码（至少 6 位）" style="flex:1;min-width:0">
             <button class="ghost-btn small" id="btnAddUser">添加用户</button>
