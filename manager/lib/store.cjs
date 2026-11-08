@@ -106,6 +106,8 @@ const DEFAULT_LOGIN_RECOVERY = {
   backupCount: 0,
   goodVerifiedAt: 0,
   decision: '',
+  probeSource: '',
+  webuiOfflineHint: false,
   restoreAttempted: false,
   restoreAction: '',
   restoreResult: '',

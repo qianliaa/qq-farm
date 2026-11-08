@@ -11,6 +11,8 @@ const STARTUP_GRACE_MS = 5 * 60 * 1000;
 const MAX_KEEPALIVE_RESTARTS = 3;
 /** 扫码窗口：用户打开登录弹窗取码后的一段时间内，保活不重启进程，避免二维码被重启作废。 */
 const QR_SESSION_PROTECT_MS = 5 * 60 * 1000;
+/** 探测到“明确离线”后隔多久复核一次，避免瞬时报文把在线账号判成掉线。 */
+const OFFLINE_RECHECK_DELAY_MS = 12 * 1000;
 
 const TASK_META = {
   keepalive: { name: '在线保活', desc: '保持电脑 QQ 在线，对应「电脑 QQ 在线 / 连续登录」加速项' },
@@ -202,10 +204,15 @@ class TaskEngine {
 
   /**
    * 探测账号真实在线状态。
-   * OneBot get_status 的 online 可能是 true / false / null（null 表示查询不到），
-   * 且 QQ 被踢下线后 NapCat 上报给 OneBot 的状态可能滞后，导致旧逻辑漏判。
-   * 因此以 NapCat WebUI 的 CheckLoginStatus（isLogin）为权威依据：
-   * WebUI 可达时以它为准，不可达时回退到 OneBot 的严格判定。
+   *
+   * 判定优先级（避免误判掉线）：
+   * 1. OneBot get_status.online===true 且能取到 user_id：最强正向证据，直接判在线，
+   *    不让 WebUI 滞后的 isLogin=false 覆盖它；
+   * 2. WebUI isLogin=true：判在线；
+   * 3. WebUI 明确返回 isLogin=false（字段存在）：才可能是真掉线；
+   * 4. 接口不可达 / 字段缺失：一律算“未确认”，不能当掉线。
+   *
+   * 只读探测，绝不生成二维码或 RefreshQRcode，否则探测本身会打断快速登录。
    */
   async probeOnline(account, client) {
     let onebotOnline = false;
@@ -225,21 +232,51 @@ class TaskEngine {
 
     let webui = null;
     try {
-      webui = await napcat.getWebuiLoginState(account);
+      webui = await napcat.getWebuiLoginStateQuiet(account);
     } catch (_e) {
       webui = null;
     }
 
-    if (webui) {
-      if (!webui.isLogin) return { online: false, confirmed: true, source: 'webui', webuiConfirmed: false };
+    if (onebotOnline) {
+      return {
+        online: true,
+        info,
+        source: 'onebot',
+        webuiConfirmed: Boolean(webui && webui.isLogin),
+        webuiOffline: Boolean(webui && webui.hasLoginFlag && webui.isLogin === false),
+      };
+    }
+
+    if (webui && webui.isLogin) {
+      const uin = webui.info && (webui.info.uin || webui.info.user_id);
       if (!info || !info.user_id) {
-        const uin = webui.info && (webui.info.uin || webui.info.user_id);
         info = { user_id: uin, nickname: webui.info && (webui.info.nickname || webui.info.nick) };
       }
-      return { online: true, info, source: onebotOnline ? 'onebot' : 'webui', webuiConfirmed: true };
+      return { online: true, info, source: 'webui', webuiConfirmed: true, webuiOffline: false };
     }
-    if (onebotOnline) return { online: true, info, source: 'onebot', webuiConfirmed: false };
-    return { online: false, confirmed: false, error: onebotError, source: 'unreachable', webuiConfirmed: false };
+
+    // 必须 WebUI 明确给出 isLogin=false；字段缺失（老版本/异常响应）不算离线。
+    if (webui && webui.hasLoginFlag && webui.isLogin === false) {
+      return {
+        online: false,
+        confirmed: true,
+        source: 'webui',
+        webuiConfirmed: false,
+        webuiOffline: true,
+        isOfflineFlag: Boolean(webui.isOffline),
+        phase: webui.phase || '',
+        loginError: webui.error || '',
+      };
+    }
+
+    return {
+      online: false,
+      confirmed: false,
+      error: onebotError,
+      source: 'unreachable',
+      webuiConfirmed: false,
+      webuiOffline: Boolean(webui && webui.isLogin === false),
+    };
   }
 
   async runKeepalive(account, task) {
@@ -247,18 +284,25 @@ class TaskEngine {
       return { ok: false, message: '账号已停止，跳过保活' };
     }
     const client = this.clientFor(account);
-    const probe = await this.probeOnline(account, client);
+    let probe = await this.probeOnline(account, client);
 
     if (probe.online) {
       const wasOnline = account.stats.online;
       this.store.recordOnline(account, probe.info && probe.info.user_id, probe.info && probe.info.nickname);
       napcat.resetRestartGuard(account);
       account.containerState = 'running';
+      // 常态在线不需要每次写诊断行，避免每 5 分钟刷一条日志。
       napcat.noteRecovery(account, {
         phase: 'keepalive',
         webuiIsLogin: probe.webuiConfirmed ? true : null,
+        decision: probe.source === 'onebot' ? 'onebot-online' : 'webui-online',
+        webuiOfflineHint: Boolean(probe.webuiOffline),
         error: '',
+        silent: wasOnline,
       });
+      if (probe.webuiOffline) {
+        this.logger.info('OneBot 已确认在线，忽略 WebUI 的滞后 isLogin=false', this.meta(account));
+      }
       // 只有 WebUI 权威确认 isLogin=true 时才允许刷新完整登录快照。
       const lastSnap = this.lastGoodSnapshot.get(account.id) || 0;
       if (probe.webuiConfirmed && Date.now() - lastSnap > 6 * 60 * 60 * 1000) {
@@ -284,15 +328,55 @@ class TaskEngine {
       napcat.noteRecovery(account, {
         phase: 'keepalive',
         webuiIsLogin: probe.source === 'webui' ? false : null,
+        decision: 'startup-grace',
         error: '启动宽限期内',
       });
       return { ok: false, message: '启动宽限期内，暂不判定' };
     }
 
+    // 明确离线先复核一次：NapCat 重连/读盘瞬间可能返回一次 isLogin=false，
+    // 单次采样就判掉线会造成“日志说掉线、实际在线”的误报。
+    if (probe.confirmed) {
+      this.logger.info(
+        `保活探测报告离线${probe.isOfflineFlag ? '（isOffline）' : ''}，${OFFLINE_RECHECK_DELAY_MS / 1000} 秒后复核`,
+        this.meta(account)
+      );
+      await sleep(OFFLINE_RECHECK_DELAY_MS);
+      const again = await this.probeOnline(account, this.clientFor(account));
+      if (again.online) {
+        this.logger.info('复核后已在线，本轮不判定掉线', this.meta(account));
+        probe = again;
+      } else if (again.confirmed) {
+        probe = again;
+      } else {
+        // 复核反而读不到状态：降级为未确认，不通知、不按“确认掉线”处理。
+        probe = { ...again, confirmed: false, error: again.error || new Error('复核时登录状态不可读') };
+      }
+    }
+
+    if (probe.online) {
+      const wasOnline = account.stats.online;
+      this.store.recordOnline(account, probe.info && probe.info.user_id, probe.info && probe.info.nickname);
+      napcat.resetRestartGuard(account);
+      account.containerState = 'running';
+      napcat.noteRecovery(account, {
+        phase: 'keepalive',
+        webuiIsLogin: probe.webuiConfirmed ? true : null,
+        decision: 'recheck-online',
+        error: '',
+        silent: wasOnline,
+      });
+      if (this.offlineNotified && this.offlineNotified.has(account.id)) {
+        this.offlineNotified.delete(account.id);
+        this.fireNotify(account, 'online');
+      }
+      return { ok: true, message: '复核后在线' };
+    }
+
     const reason = probe.confirmed
       ? 'QQ 当前不在线'
       : `OneBot 与 WebUI 均无响应${probe.error ? `：${probe.error.message}` : ''}`;
-    // 已确认离线时立刻标记，面板第一时间显示离线；接口异常则等达到阈值再标记。
+    // 已确认离线（且复核仍离线）才标记面板与发通知；接口异常等达到阈值再标记。
     if (probe.confirmed) {
       this.store.recordOffline(account);
       this.fireNotify(account, 'offline');
@@ -304,6 +388,8 @@ class TaskEngine {
     napcat.noteRecovery(account, {
       phase: 'keepalive',
       webuiIsLogin: probe.source === 'webui' ? false : null,
+      decision: probe.confirmed ? 'offline-confirmed' : 'probe-unreachable',
+      probeSource: probe.source,
       error: reason,
     });
     this.store.save();
@@ -343,8 +429,10 @@ class TaskEngine {
 
     // 快速登录失效（票据损坏/被清理）时，用登录成功后的完整快照覆盖并重启。
     // 30 分钟内只尝试一次，避免死循环。
+    // 只有“明确离线”才走快照覆盖：接口不可达时用旧快照覆盖当前数据，
+    // 可能把仍然有效的票据换成过期票据，属于自己把账号搞掉线。
     const lastRestore = Number(account.loginRestoreAt) || 0;
-    if (napcat.hasGoodLogin(account) && Date.now() - lastRestore > 30 * 60 * 1000) {
+    if (napcat.hasGoodLogin(account) && probe.confirmed && Date.now() - lastRestore > 30 * 60 * 1000) {
       const restoreGuard = napcat.noteRestartAttempt(account);
       if (restoreGuard.attempts > MAX_KEEPALIVE_RESTARTS) {
         restoreGuard.suspended = true;

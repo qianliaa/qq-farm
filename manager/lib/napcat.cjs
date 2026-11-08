@@ -40,7 +40,18 @@ const runtimeState = {
 
 const startLocks = new Map();
 const copyLocks = new Map();
+/** 主动停止中的进程集合：一次停止可能涉及 xvfb-run / Xvfb / qq 多个 pid。 */
 const expectedExits = new Map();
+
+function markExpectedExit(accountId, pids) {
+  expectedExits.set(accountId, new Set(pids.filter(Boolean)));
+  return expectedExits.get(accountId);
+}
+
+function isExpectedExit(accountId, pid) {
+  const set = expectedExits.get(accountId);
+  return Boolean(set && set.has(pid));
+}
 
 /* ------------------------------- 工具函数 ------------------------------- */
 
@@ -547,16 +558,31 @@ function probePort(port, timeout = 400) {
   });
 }
 
-async function assertPortsAvailable(account) {
+/**
+ * 端口释放有延迟：刚 SIGKILL 掉的进程，监听 socket 可能还短暂存在。
+ * 立即报“端口被占用”会让账号卡在 error 反复重启，这里等一小会儿再下结论。
+ */
+async function assertPortsAvailable(account, { waitMs = 15000 } = {}) {
   const ports = [
     ['WebUI', Number(account.webuiPort) || 0],
     ['OneBot', Number(account.onebotPort) || 0],
-  ];
-  for (const [name, port] of ports) {
-    if (!port) continue;
-    if (await probePort(port)) {
-      throw new Error(`${name} 端口 ${port} 已被占用，请先停止占用该端口的进程`);
+  ].filter(([, port]) => port > 0);
+  if (!ports.length) return;
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    let busy = null;
+    for (const [name, port] of ports) {
+      // eslint-disable-next-line no-await-in-loop
+      if (await probePort(port)) {
+        busy = { name, port };
+        break;
+      }
     }
+    if (!busy) return;
+    if (Date.now() >= deadline) {
+      throw new Error(`${busy.name} 端口 ${busy.port} 已被占用，请先停止占用该端口的进程`);
+    }
+    await sleep(500);
   }
 }
 
@@ -729,7 +755,7 @@ async function startAccountUnlocked(account) {
         }
         account.pid = 0;
       }
-      if (!expectedExits.get(account.id)) {
+      if (!isExpectedExit(account.id, child.pid)) {
         account.containerState = 'error';
         account.lastError = `QQ 进程启动失败：${err.message}`;
         if (account.stats) account.stats.online = false;
@@ -747,7 +773,7 @@ async function startAccountUnlocked(account) {
         }
         account.pid = 0;
       }
-      const expected = expectedExits.get(account.id) === child.pid;
+      const expected = isExpectedExit(account.id, child.pid);
       appendAccountLog(
         account,
         `QQ 进程退出：code=${code === null ? 'null' : code} signal=${signal || 'none'}${expected ? '（主动停止）' : '（异常退出）'}`
@@ -1083,6 +1109,8 @@ const RECOVERY_DEFAULTS = {
   backupCount: 0,
   goodVerifiedAt: 0,
   decision: '',
+  probeSource: '',
+  webuiOfflineHint: false,
   restoreAttempted: false,
   restoreResult: '',
   restoreAction: '',
@@ -1117,6 +1145,8 @@ function noteRecovery(account, patch = {}) {
         backupCount: Number(record.backupCount) || 0,
         goodVerifiedAt: iso(record.goodVerifiedAt),
         decision: record.decision || '',
+        probeSource: record.probeSource || '',
+        webuiOfflineHint: Boolean(record.webuiOfflineHint),
         restoredAt: iso(record.restoredAt),
         restoreAttempted: record.restoreAttempted,
         restoreAction: record.restoreAction,
@@ -1132,6 +1162,10 @@ function noteRecovery(account, patch = {}) {
 /** 停止前把整份 QQ 数据（global + 全部 nt_qq_*）备份，滚动保留最近两份。 */
 async function backupSessionState(dirs) {
   const qqRoot = dirs.qqData;
+  // 已有可用的整体快照时不再额外整份复制：
+  // 停止后还会生成一份一致的快照，进程仍在写盘时复制既慢又可能复制到半份数据。
+  const good = inspectSnapshotDir(path.join(dirs.root, 'session-good'));
+  if (good.valid && good.kind === 'dataset') return false;
   const current = inspectQqDataSet(qqRoot);
   if (!current.valid) return false;
   const { staging, live, prev } = sessionBackupPaths(dirs);
@@ -1637,8 +1671,11 @@ async function stopAccountUnlocked(account, { preserveDesired = false, snapshotG
   // 先快照 global 再停进程，防止强杀/断电导致票据损坏后无法自动重登。
   await backupSessionState(dirs);
 
+  let exitMark = null;
   if (pids.length) {
-    expectedExits.set(account.id, pid || Number(account.pid) || pids[0]);
+    // 记录本次停止涉及的全部 pid：xvfb-run / Xvfb / qq 的退出事件都算“主动停止”，
+    // 避免把正常退出误判成异常退出、进而抬升失败计数触发暂停。
+    exitMark = markExpectedExit(account.id, pids);
     for (const item of pids) await killProcessGroup(item);
     // 给足 10 秒让 QQ 把登录态写盘，尽量避免走到 SIGKILL。
     const gone = await waitGone(pids, 10000);
@@ -1668,7 +1705,16 @@ async function stopAccountUnlocked(account, { preserveDesired = false, snapshotG
     }
   }
 
-  expectedExits.delete(account.id);
+  // 退出事件可能比 waitGone 稍晚送达：延后清理“主动停止”标记，
+  // 否则正常停止会被记成异常退出并累加失败计数。
+  if (exitMark) {
+    const timer = setTimeout(() => {
+      if (expectedExits.get(account.id) === exitMark) expectedExits.delete(account.id);
+    }, 15000);
+    if (timer.unref) timer.unref();
+  } else {
+    expectedExits.delete(account.id);
+  }
   try {
     fs.rmSync(dirs.pidFile, { force: true });
   } catch (_e) {
@@ -1821,21 +1867,54 @@ function extractQrcode(data) {
   );
 }
 
-async function getWebuiLoginStatus(account, timeout = 5000) {
+/**
+ * 只读登录状态：只调 CheckLoginStatus（登录后顺带读一次登录信息），
+ * 绝不生成二维码、绝不 RefreshQRcode。
+ * 保活探测、面板状态轮询这类高频只读路径必须用这个，
+ * 否则一次瞬时 isLogin=false 就会触发取码/刷新，把正在快速登录的账号打断。
+ */
+async function getWebuiLoginStateQuiet(account, timeout = 6000) {
+  let status;
   try {
-    const status = await webuiPost(account, '/api/QQLogin/CheckLoginStatus', {}, timeout);
-    if (!status || status.code !== 0) return null;
-    const data = status.data || {};
-    return {
-      isLogin: Boolean(data.isLogin),
-      isOffline: Boolean(data.isOffline),
-      phase: data.loginPhase || '',
-      error: data.loginError || '',
-      info: null,
-    };
+    status = await webuiPost(account, '/api/QQLogin/CheckLoginStatus', {}, timeout);
   } catch (_e) {
     return null;
   }
+  if (!status || status.code !== 0) return null;
+  const data = status.data || {};
+  // 老版本 NapCat 可能不带 isLogin 字段：字段缺失时不能当成“明确离线”。
+  const hasLoginFlag = Object.prototype.hasOwnProperty.call(data, 'isLogin');
+  let info = null;
+  if (data.isLogin) {
+    try {
+      const infoResult = await webuiPost(account, '/api/QQLogin/GetQQLoginInfo', {}, timeout);
+      if (infoResult && infoResult.code === 0) info = infoResult.data || null;
+    } catch (_e) {
+      /* 信息接口失败不影响登录状态 */
+    }
+  }
+  return {
+    isLogin: Boolean(data.isLogin),
+    isOffline: Boolean(data.isOffline),
+    hasLoginFlag,
+    phase: data.loginPhase || '',
+    error: data.loginError || '',
+    qrcode: '',
+    info,
+  };
+}
+
+async function getWebuiLoginStatus(account, timeout = 5000) {
+  const state = await getWebuiLoginStateQuiet(account, timeout);
+  if (!state) return null;
+  return {
+    isLogin: state.isLogin,
+    isOffline: state.isOffline,
+    hasLoginFlag: state.hasLoginFlag,
+    phase: state.phase,
+    error: state.error,
+    info: state.info,
+  };
 }
 
 async function getWebuiLoginState(account) {
@@ -1985,6 +2064,7 @@ module.exports = {
   writeOnebotConfig,
   ensureAccountOnebotConfig,
   getWebuiLoginState,
+  getWebuiLoginStateQuiet,
   getWebuiLoginStatus,
   refreshQrcode,
   resetLoginState,

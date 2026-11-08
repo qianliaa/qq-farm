@@ -13,7 +13,7 @@ const { Logger } = require('./lib/logger.cjs');
 const napcat = require('./lib/napcat.cjs');
 const { TaskEngine, TASK_KEYS, TASK_META } = require('./lib/tasks.cjs');
 
-const APP_VERSION = '2.0.22';
+const APP_VERSION = '2.0.23';
 const UPDATE_REPO = (process.env.QQNAS_UPDATE_REPO || 'qianliaa/qq-online').trim();
 const PORT = Number(process.env.PORT) || 8787;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -431,6 +431,8 @@ async function ensureAccountPorts() {
 /* ------------------------------ 状态探测 ------------------------------ */
 
 const statusCache = new Map();
+/** 状态探测单飞：同一账号同时只允许一个探测在跑。 */
+const probeInflight = new Map();
 const CONFIG_STATE = new Map();
 const starting = new Set();
 
@@ -533,6 +535,8 @@ const QR_RESET_AFTER_RESTORE = 5 * 60 * 1000;
 const qrEmptyRounds = new Map();
 const qrResetDeferred = new Map();
 const qrResetting = new Set();
+/** 主动刷新二维码的连续失败次数：一次超时不足以判定票据失效。 */
+const qrRefreshFails = new Map();
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -635,10 +639,51 @@ function resetAccountForQrcode(account, { force = false } = {}) {
     });
 }
 
+/**
+ * 主动刷新二维码失败：先确认账号是否真的没登录，并且连续失败两次才允许重置票据。
+ * 之前一次取码超时就删票据，会把仍然有效的登录态自己清掉。
+ */
+async function handleQrRefreshFailure(account, res, error) {
+  const fails = (qrRefreshFails.get(account.id) || 0) + 1;
+  qrRefreshFails.set(account.id, fails);
+  if (fails < 2) {
+    logger.warn('刷新二维码失败，先重试一次再考虑重置登录态', {
+      accountId: account.id,
+      account: account.alias,
+      error: error || '',
+    });
+    return json(res, 200, { ok: true, retry: true, error: error || '二维码暂不可用' });
+  }
+  try {
+    const state = await napcat.getWebuiLoginStateQuiet(account);
+    if (state && state.isLogin) {
+      qrRefreshFails.delete(account.id);
+      cacheQrState(account.id, { isLogin: true, qrcode: '', info: state.info, fetchedAt: Date.now() });
+      return json(res, 200, { ok: true, isLogin: true });
+    }
+  } catch (_e) {
+    /* 读不到就按失效处理 */
+  }
+  qrRefreshFails.delete(account.id);
+  resetAccountForQrcode(account, { force: true });
+  return json(res, 200, { ok: true, resetting: true, error: error || '二维码已失效' });
+}
+
 async function probeAccount(account, { force = false } = {}) {
   const cached = statusCache.get(account.id);
   if (!force && cached && Date.now() - cached.at < 4000) return cached.value;
+  // 面板每 5 秒轮询一次状态：同一账号的探测必须单飞，
+  // 否则请求会堆叠，把 NapCat 打慢甚至拖垮。
+  const pending = probeInflight.get(account.id);
+  if (!force && pending) return pending;
+  const run = probeAccountOnce(account).finally(() => {
+    if (probeInflight.get(account.id) === run) probeInflight.delete(account.id);
+  });
+  probeInflight.set(account.id, run);
+  return run;
+}
 
+async function probeAccountOnce(account) {
   if (MOCK) {
     const value = {
       running: true,
@@ -709,8 +754,10 @@ async function probeAccount(account, { force = false } = {}) {
 
   if (!result.online && info.running && info.webuiReady) {
     try {
-      const webui = await napcat.getWebuiLoginState(account);
-      if (webui.isLogin) {
+      // 只读探测：不能在这里顺手生成二维码/RefreshQRcode，
+      // 否则面板每 5 秒轮询一次就可能把正在快速登录的账号打断。
+      const webui = await napcat.getWebuiLoginStateQuiet(account);
+      if (webui && webui.isLogin) {
         // OneBot 状态不明确时，以 NapCat WebUI 的登录态为准。
         result.webuiLoggedIn = true;
         result.online = true;
@@ -1270,16 +1317,15 @@ async function handleApi(req, res, url) {
         // 主动刷新后旧缓存作废；拿到新码就直接入缓存，下次轮询秒回。
         qrcodeCache.delete(account.id);
         if (qrcode) {
+          qrRefreshFails.delete(account.id);
           cacheQrState(account.id, { qrcode, isLogin: false });
           return json(res, 200, { ok: true, qrcode });
         }
-        // 主动刷新也拿不到码：旧票据已失效，重置登录态后重新出码（后台进行）。
-        resetAccountForQrcode(account, { force: true });
-        return json(res, 200, { ok: true, resetting: true });
+        // 主动刷新也拿不到码：连续失败两次、且确认未登录，才重置登录态。
+        return handleQrRefreshFailure(account, res, '二维码为空');
       } catch (err) {
-        // 取码超时同样说明内核没进扫码阶段，按失效处理。
-        resetAccountForQrcode(account, { force: true });
-        return json(res, 200, { ok: true, resetting: true, error: err.message });
+        // 取码超时先重试；连续失败两次才按票据失效处理。
+        return handleQrRefreshFailure(account, res, err.message);
       }
     }
 
@@ -1539,6 +1585,16 @@ async function supervise() {
         }
         const guard = napcat.noteRestartAttempt(account);
         changed = true;
+        // 反复起不来时暂停自动重启，避免 30 秒一轮的重启风暴把账号拖死。
+        if (guard.attempts > MAX_AUTO_RESTARTS) {
+          guard.suspended = true;
+          account.lastError = '进程反复退出，已暂停自动重启，请查看账号日志';
+          logger.warn(`NapCat 连续 ${guard.attempts} 次未能稳定运行，已暂停自动重启`, {
+            accountId: account.id,
+            account: account.alias,
+          });
+          continue;
+        }
         logger.warn(`NapCat 未运行，自动重启（第 ${guard.attempts}/${MAX_AUTO_RESTARTS} 次）`, {
           accountId: account.id,
           account: account.alias,
