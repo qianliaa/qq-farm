@@ -78,6 +78,28 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+const DEFAULT_RESTART_GUARD = {
+  suspended: false,
+  failures: 0,
+  attempts: 0,
+  nextRetryAt: 0,
+  lastAttemptAt: 0,
+  updatedAt: 0,
+};
+
+const DEFAULT_LOGIN_RECOVERY = {
+  at: 0,
+  snapshotFound: false,
+  snapshotAt: 0,
+  snapshotSize: 0,
+  snapshotSource: '',
+  restoreAttempted: false,
+  restoreAction: '',
+  restoreResult: '',
+  webuiIsLogin: null,
+  error: '',
+};
+
 function createAccountRecord(alias) {
   const id = crypto.randomBytes(4).toString('hex');
   return {
@@ -95,6 +117,8 @@ function createAccountRecord(alias) {
     webuiToken: crypto.randomBytes(12).toString('hex'),
     onebotToken: crypto.randomBytes(16).toString('hex'),
     hookSecret: crypto.randomBytes(16).toString('hex'),
+    autoRestartGuard: { ...DEFAULT_RESTART_GUARD },
+    loginRecovery: { ...DEFAULT_LOGIN_RECOVERY },
     tasks: defaultTasks(),
     stats: {
       onlineDays: [],
@@ -136,6 +160,9 @@ class Store {
       for (const account of this.data.accounts) {
         account.tasks = { ...defaultTasks(), ...(account.tasks || {}) };
         account.stats = { onlineDays: [], lastSeen: 0, lastLoginAt: 0, online: false, ...(account.stats || {}) };
+        // 旧 config.json 没有这两个字段，补齐后保持向前兼容。
+        account.autoRestartGuard = { ...DEFAULT_RESTART_GUARD, ...(account.autoRestartGuard || {}) };
+        account.loginRecovery = { ...DEFAULT_LOGIN_RECOVERY, ...(account.loginRecovery || {}) };
       }
     } catch (err) {
       const backup = `${CONFIG_FILE}.broken-${Date.now()}`;

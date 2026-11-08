@@ -40,6 +40,7 @@ const runtimeState = {
 
 const startLocks = new Map();
 const copyLocks = new Map();
+const expectedExits = new Map();
 
 /* ------------------------------- 工具函数 ------------------------------- */
 
@@ -49,6 +50,78 @@ function sha256(text) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 账号级生命周期锁：start/stop/restart/snapshot/restore/reset 共用一条队列。
+ * 后到的请求排在前面操作完成之后执行，从而让“最后一次操作”落到最终状态。
+ */
+const accountLocks = new Map();
+
+function withAccountLock(accountOrId, task) {
+  const id = typeof accountOrId === 'string' ? accountOrId : accountOrId.id;
+  const previous = accountLocks.get(id) || Promise.resolve();
+  const run = previous.then(() => task());
+  const gate = run.catch(() => {});
+  const stored = gate.finally(() => {
+    if (accountLocks.get(id) === stored) accountLocks.delete(id);
+  });
+  accountLocks.set(id, stored);
+  return run;
+}
+
+const RESTART_GUARD_DEFAULTS = Object.freeze({
+  suspended: false,
+  failures: 0,
+  attempts: 0,
+  nextRetryAt: 0,
+  lastAttemptAt: 0,
+  updatedAt: 0,
+});
+
+function ensureRestartGuard(account) {
+  account.autoRestartGuard = { ...RESTART_GUARD_DEFAULTS, ...(account.autoRestartGuard || {}) };
+  return account.autoRestartGuard;
+}
+
+function resetRestartGuard(account) {
+  account.autoRestartGuard = { ...RESTART_GUARD_DEFAULTS, updatedAt: Date.now() };
+  return account.autoRestartGuard;
+}
+
+function restartBackoffMs(attempts) {
+  const n = Math.max(1, Number(attempts) || 1);
+  return Math.min(30 * 60 * 1000, 30 * 1000 * Math.pow(2, n - 1));
+}
+
+function noteRestartAttempt(account) {
+  const guard = ensureRestartGuard(account);
+  guard.attempts = Number(guard.attempts || 0) + 1;
+  guard.lastAttemptAt = Date.now();
+  guard.nextRetryAt = Date.now() + restartBackoffMs(guard.attempts);
+  guard.updatedAt = Date.now();
+  return guard;
+}
+
+function noteRestartFailure(account) {
+  const guard = ensureRestartGuard(account);
+  guard.failures = Number(guard.failures || 0) + 1;
+  guard.updatedAt = Date.now();
+  return guard;
+}
+
+function canAutoRestart(account, now = Date.now()) {
+  const guard = ensureRestartGuard(account);
+  return !guard.suspended && now >= Number(guard.nextRetryAt || 0);
+}
+
+function appendAccountLog(account, message) {
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    fs.appendFileSync(accountDirs(account).log, `[${new Date().toISOString()}] ${message}\n`);
+  } catch (_e) {
+    /* 日志失败不能影响主流程 */
+  }
 }
 
 function tailFile(file, lines = 80) {
@@ -289,6 +362,35 @@ function runCommand(command, args, options = {}) {
   });
 }
 
+function runCommandOutput(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { ...options, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString('utf8');
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString('utf8');
+    });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code === 0) resolve(stdout);
+      else reject(new Error(`${command} 退出码 ${code}${stderr ? `：${stderr.slice(-300)}` : ''}`));
+    });
+  });
+}
+
+async function measureDirSize(dir) {
+  try {
+    const output = await runCommandOutput('du', ['-sb', dir]);
+    const bytes = Number(String(output).trim().split(/\s+/)[0]);
+    return Number.isFinite(bytes) ? bytes : 0;
+  } catch (_e) {
+    return 0;
+  }
+}
+
 async function copyRuntime(account) {
   if (copyLocks.has(account.id)) return copyLocks.get(account.id);
   const task = (async () => {
@@ -445,6 +547,19 @@ function probePort(port, timeout = 400) {
   });
 }
 
+async function assertPortsAvailable(account) {
+  const ports = [
+    ['WebUI', Number(account.webuiPort) || 0],
+    ['OneBot', Number(account.onebotPort) || 0],
+  ];
+  for (const [name, port] of ports) {
+    if (!port) continue;
+    if (await probePort(port)) {
+      throw new Error(`${name} 端口 ${port} 已被占用，请先停止占用该端口的进程`);
+    }
+  }
+}
+
 /** 判断进程是否真的属于该账号（HOME 指向账号目录），避免 PID 复用误杀。 */
 function processBelongsToHome(pid, home) {
   if (process.platform !== 'linux') return true;
@@ -532,6 +647,10 @@ async function prepareAccount(account) {
 }
 
 async function startAccount(account) {
+  return withAccountLock(account, () => startAccountUnlocked(account));
+}
+
+async function startAccountUnlocked(account) {
   account.desiredState = 'running';
   const dirs = ensureAccountDirs(account);
   const existing = readPid(account);
@@ -542,6 +661,22 @@ async function startAccount(account) {
   }
   if (startLocks.has(account.id)) return startLocks.get(account.id);
 
+  // pid 文件可能丢失或过期，但 QQ 仍以本账号 HOME 存活：先接管，避免同 HOME 起第二份。
+  const homePids = findPidsByHome(dirs.home).filter((pid) => isAlive(pid) && !isProtectedPid(pid));
+  if (homePids.length) {
+    if (homePids.length === 1) {
+      const pid = homePids[0];
+      fs.writeFileSync(dirs.pidFile, String(pid), 'utf8');
+      account.pid = pid;
+      account.containerState = 'running';
+      appendAccountLog(account, `发现同 HOME 的孤儿 NapCat 进程 ${pid}，已接管`);
+      return { ok: true, pid, adopted: true };
+    }
+    appendAccountLog(account, `发现 ${homePids.length} 个同 HOME 孤儿进程，先全部停止再重新启动`);
+    for (const pid of homePids) await killProcessGroup(pid);
+    await waitGone(homePids, 5000);
+  }
+
   const task = (async () => {
     if (!isRuntimeReady()) {
       startRuntimeIfNeeded(account);
@@ -549,8 +684,9 @@ async function startAccount(account) {
       return { ok: false, message: 'QQ 运行环境正在安装' };
     }
     await prepareAccount(account);
-    // 登录态目录缺失时（误清/损坏/迁移）用最近快照恢复，保住免扫码自动登录。
-    await restoreSessionStateIfMissing(dirs);
+    // 登录态目录缺失或关键文件不可用时用快照恢复，保住免扫码自动登录。
+    await restoreSessionStateIfMissingUnlocked(account, dirs);
+    await assertPortsAvailable(account);
 
     const logFd = fs.openSync(dirs.log, 'a');
     fs.writeSync(logFd, `\n===== ${new Date().toISOString()} 启动 NapCat =====\n`);
@@ -583,11 +719,67 @@ async function startAccount(account) {
     child.unref();
     fs.closeSync(logFd);
 
+    child.on('error', (err) => {
+      const current = readPid(account);
+      if (child.pid && current === child.pid) {
+        try {
+          fs.rmSync(dirs.pidFile, { force: true });
+        } catch (_e) {
+          /* ignore */
+        }
+        account.pid = 0;
+      }
+      if (!expectedExits.get(account.id)) {
+        account.containerState = 'error';
+        account.lastError = `QQ 进程启动失败：${err.message}`;
+        if (account.stats) account.stats.online = false;
+      }
+      appendAccountLog(account, `QQ 进程 error：${err.message}`);
+    });
+
+    child.on('exit', (code, signal) => {
+      const current = readPid(account);
+      if (child.pid && current === child.pid) {
+        try {
+          fs.rmSync(dirs.pidFile, { force: true });
+        } catch (_e) {
+          /* ignore */
+        }
+        account.pid = 0;
+      }
+      const expected = expectedExits.get(account.id) === child.pid;
+      appendAccountLog(
+        account,
+        `QQ 进程退出：code=${code === null ? 'null' : code} signal=${signal || 'none'}${expected ? '（主动停止）' : '（异常退出）'}`
+      );
+      if (!expected) {
+        account.containerState = 'error';
+        account.lastError = `QQ 进程异常退出（code=${code === null ? 'null' : code}, signal=${signal || 'none'}）`;
+        account.lastExitAt = Date.now();
+        if (account.stats) account.stats.online = false;
+        const guard = noteRestartFailure(account);
+        guard.updatedAt = Date.now();
+      }
+    });
+
     if (!child.pid) throw new Error('无法启动 QQ 进程');
     fs.writeFileSync(dirs.pidFile, String(child.pid), 'utf8');
     account.pid = child.pid;
     account.startedAt = Date.now();
     account.containerState = 'running';
+
+    // 启动 90 秒后记录一次 WebUI 权威 isLogin，下一次重启时可直接看到“起来后到底登没登”。
+    const loginCheckTimer = setTimeout(async () => {
+      if (account.desiredState !== 'running' || Number(account.pid) !== Number(child.pid)) return;
+      const login = await getWebuiLoginStatus(account, 5000);
+      noteRecovery(account, {
+        phase: 'post-start',
+        webuiIsLogin: login ? login.isLogin : null,
+        error: login ? (login.isLogin ? '' : `WebUI 返回未登录${login.isOffline ? '（离线）' : ''}`) : 'WebUI 无响应',
+      });
+    }, 90000);
+    if (loginCheckTimer.unref) loginCheckTimer.unref();
+
     return { ok: true, pid: child.pid };
   })();
 
@@ -606,10 +798,8 @@ async function startAccount(account) {
 /* ------------------------------- 登录态保护 ------------------------------- */
 
 /**
- * QQ 登录态（设备信息、登录票据）保存在 ~/.config/QQ/nt_qq/global，体积很小。
- * 每次停止进程前先快照、启动时若目录缺失则用快照恢复，确保各种重启
- * （保活自动重启、手动重启、面板或 NAS 重启后拉起）都保住登录状态，
- * 即使进程被 SIGKILL 强杀或断电导致票据损坏，也不必重新扫码。
+ * QQ 登录态（设备信息、登录票据）保存在 ~/.config/QQ/nt_qq/global。
+ * 停止前快照、启动时校验并恢复，确保各种重启都尽量保住登录状态。
  */
 function sessionGlobalDir(dirs) {
   return path.join(dirs.qqData, 'nt_qq', 'global');
@@ -620,10 +810,199 @@ function sessionBackupPaths(dirs) {
   return { staging: `${live}.new`, live, prev: `${live}.prev` };
 }
 
+function goodSessionPaths(dirs) {
+  const live = path.join(dirs.root, 'session-good');
+  return {
+    live,
+    prev: `${live}.prev`,
+    liveMeta: `${live}.meta.json`,
+    prevMeta: `${live}.prev.meta.json`,
+  };
+}
+
+function readSnapshotMeta(dirOrMeta) {
+  const file = dirOrMeta.endsWith('.json') ? dirOrMeta : `${dirOrMeta}.meta.json`;
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (_e) {
+    return null;
+  }
+}
+
+function writeSnapshotMeta(dir, meta) {
+  try {
+    fs.writeFileSync(`${dir}.meta.json`, JSON.stringify(meta, null, 2), 'utf8');
+  } catch (_e) {
+    /* 元信息写失败不影响快照本身 */
+  }
+}
+
+/** 以有限深度统计目录中的普通文件数与字节数，用于判断快照是否“非空可用”。 */
+function inspectDir(dir, limit = 50) {
+  const result = { exists: false, files: 0, bytes: 0 };
+  try {
+    if (!fs.statSync(dir).isDirectory()) return result;
+  } catch (_e) {
+    return result;
+  }
+  result.exists = true;
+  const stack = [dir];
+  while (stack.length && result.files < limit) {
+    const current = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch (_e) {
+      continue;
+    }
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(full);
+      } else if (entry.isFile()) {
+        result.files += 1;
+        try {
+          result.bytes += fs.statSync(full).size;
+        } catch (_e) {
+          /* ignore */
+        }
+        if (result.files >= limit) break;
+      }
+    }
+  }
+  return result;
+}
+
+/** 完整 nt_qq 快照必须包含非空的 global 子目录。 */
+function inspectNtSnapshot(dir) {
+  const base = inspectDir(dir, 1);
+  if (!base.exists) return { ...base, valid: false };
+  const global = inspectDir(path.join(dir, 'global'));
+  return {
+    ...base,
+    globalFiles: global.files,
+    globalBytes: global.bytes,
+    valid: base.exists && global.files > 0 && global.bytes > 0,
+  };
+}
+
+function inspectGlobalSnapshot(dir) {
+  const info = inspectDir(dir);
+  return { ...info, valid: info.exists && info.files > 0 && info.bytes > 0 };
+}
+
+async function describeSnapshot(dir, fullNt) {
+  const inspection = fullNt ? inspectNtSnapshot(dir) : inspectGlobalSnapshot(dir);
+  const meta = readSnapshotMeta(dir);
+  let byteSize = Number(meta && meta.size) || 0;
+  if (!byteSize && inspection.exists) byteSize = await measureDirSize(dir);
+  let mtime = 0;
+  try {
+    mtime = Math.round(fs.statSync(dir).mtimeMs);
+  } catch (_e) {
+    /* ignore */
+  }
+  return {
+    path: dir,
+    exists: inspection.exists,
+    valid: inspection.valid,
+    files: inspection.files,
+    size: byteSize,
+    verifiedAt: Number(meta && (meta.verifiedAt || meta.createdAt)) || mtime,
+    meta,
+  };
+}
+
+async function copyDir(src, dest) {
+  try {
+    // fnOS 用 btrfs 时 reflink 几乎不占空间；不支持则自动全量复制。
+    await runCommand('cp', ['-a', '--reflink=auto', src, dest]);
+  } catch (_e) {
+    fs.rmSync(dest, { recursive: true, force: true });
+    await runCommand('cp', ['-a', src, dest]);
+  }
+}
+
+/**
+ * 复制到临时目录 -> 校验 -> 原子 rename。
+ * 目标目录在校验通过前不会被删除；rename 失败会把原目录移回来。
+ */
+async function replaceDirAtomically(src, target, validator) {
+  const parent = path.dirname(target);
+  const suffix = crypto.randomBytes(6).toString('hex');
+  const temp = `${target}.restore-${suffix}`;
+  const aside = `${target}.old-${suffix}`;
+  fs.mkdirSync(parent, { recursive: true });
+  try {
+    fs.rmSync(temp, { recursive: true, force: true });
+    await copyDir(src, temp);
+    if (!validator(temp)) throw new Error('复制后的快照校验失败');
+    let moved = false;
+    if (fs.existsSync(target)) {
+      fs.renameSync(target, aside);
+      moved = true;
+    }
+    try {
+      fs.renameSync(temp, target);
+    } catch (err) {
+      if (moved) {
+        try {
+          fs.renameSync(aside, target);
+        } catch (_restoreErr) {
+          throw new Error(`${err.message}；原目录暂存在 ${aside}`);
+        }
+      }
+      throw err;
+    }
+    if (moved) fs.rmSync(aside, { recursive: true, force: true });
+    return true;
+  } catch (err) {
+    fs.rmSync(temp, { recursive: true, force: true });
+    throw err;
+  }
+}
+
+const RECOVERY_DEFAULTS = {
+  at: 0,
+  snapshotFound: false,
+  snapshotAt: 0,
+  snapshotSize: 0,
+  snapshotSource: '',
+  restoreAttempted: false,
+  restoreResult: '',
+  restoreAction: '',
+  webuiIsLogin: null,
+  error: '',
+};
+
+function noteRecovery(account, patch = {}) {
+  const { silent = false, ...data } = patch;
+  account.loginRecovery = { ...RECOVERY_DEFAULTS, ...(account.loginRecovery || {}), ...data, at: Date.now() };
+  if (!silent) {
+    const record = account.loginRecovery;
+    appendAccountLog(
+      account,
+      `登录态诊断 ${JSON.stringify({
+        phase: record.phase || '',
+        snapshotFound: record.snapshotFound,
+        snapshotAt: record.snapshotAt ? new Date(record.snapshotAt).toISOString() : '',
+        snapshotSize: record.snapshotSize,
+        snapshotSource: record.snapshotSource,
+        restoreAttempted: record.restoreAttempted,
+        restoreAction: record.restoreAction,
+        restoreResult: record.restoreResult,
+        webuiIsLogin: record.webuiIsLogin,
+        error: record.error || '',
+      })}`
+    );
+  }
+  return account.loginRecovery;
+}
+
 /** 停止前快照登录态，滚动保留最近两份。 */
 async function backupSessionState(dirs) {
   const src = sessionGlobalDir(dirs);
-  if (!fs.existsSync(src)) return false;
+  if (!inspectGlobalSnapshot(src).valid) return false;
   const { staging, live, prev } = sessionBackupPaths(dirs);
   try {
     fs.rmSync(staging, { recursive: true, force: true });
@@ -640,100 +1019,345 @@ async function backupSessionState(dirs) {
   }
 }
 
-/** 启动前若登录态目录缺失（数据被误清或异常损坏），用最近一份快照恢复。 */
-async function restoreSessionStateIfMissing(dirs) {
+/** 启动前校验登录态：目录存在但关键文件为空/缺失时也算不可用并恢复。 */
+async function restoreSessionStateIfMissing(account) {
+  return withAccountLock(account, () => restoreSessionStateIfMissingUnlocked(account, accountDirs(account)));
+}
+
+async function restoreSessionStateIfMissingUnlocked(account, dirs) {
   const ntDir = path.join(dirs.qqData, 'nt_qq');
-  // 整个 nt_qq 没了：优先用「登录成功后的完整快照」，QQ 起来就是已登录状态。
-  if (!fs.existsSync(ntDir)) {
-    const good = goodSessionDir(dirs);
-    if (fs.existsSync(good)) {
+  const global = sessionGlobalDir(dirs);
+  const ntState = inspectNtSnapshot(ntDir);
+  const globalState = inspectGlobalSnapshot(global);
+  const goodPaths = goodSessionPaths(dirs);
+  const goods = [
+    ['session-good', goodPaths.live],
+    ['session-good.prev', goodPaths.prev],
+  ];
+  const backupPaths = sessionBackupPaths(dirs);
+  const backups = [
+    ['session-backup', backupPaths.live],
+    ['session-backup.prev', backupPaths.prev],
+  ];
+  const goodReports = [];
+  for (const [name, dir] of goods) {
+    const report = await describeSnapshot(dir, true);
+    if (report.valid) goodReports.push({ name, ...report });
+  }
+  const backupReports = [];
+  for (const [name, dir] of backups) {
+    const report = await describeSnapshot(dir, false);
+    if (report.valid) backupReports.push({ name, ...report });
+  }
+  const bestGood = goodReports[0];
+  const baseRecord = {
+    phase: 'startup',
+    snapshotFound: goodReports.length > 0,
+    snapshotAt: bestGood ? bestGood.verifiedAt : 0,
+    snapshotSize: bestGood ? bestGood.size : 0,
+    snapshotSource: bestGood ? bestGood.name : '',
+    ntNtExists: ntState.exists,
+    ntNtValid: ntState.valid,
+    globalExists: globalState.exists,
+    globalValid: globalState.valid,
+    goodSnapshotFound: goodReports.length > 0,
+    globalBackupFound: backupReports.length > 0,
+  };
+
+  if (!ntState.valid) {
+    for (const report of goodReports) {
       try {
-        fs.mkdirSync(dirs.qqData, { recursive: true });
-        await runCommand('cp', ['-a', good, ntDir]);
+        await replaceDirAtomically(report.path, ntDir, (dir) => inspectNtSnapshot(dir).valid);
+        noteRecovery(account, {
+          ...baseRecord,
+          snapshotFound: true,
+          snapshotAt: report.verifiedAt,
+          snapshotSize: report.size,
+          snapshotSource: report.name,
+          restoreAttempted: true,
+          restoreAction: 'restore-nt_qq',
+          restoreResult: 'success',
+          error: '',
+        });
         return true;
-      } catch (_e) {
-        /* 退回下面的 global 快照 */
+      } catch (err) {
+        noteRecovery(account, {
+          ...baseRecord,
+          snapshotFound: true,
+          snapshotAt: report.verifiedAt,
+          snapshotSize: report.size,
+          snapshotSource: report.name,
+          restoreAttempted: true,
+          restoreAction: 'restore-nt_qq',
+          restoreResult: 'failed',
+          error: err.message,
+        });
       }
     }
   }
-  const target = sessionGlobalDir(dirs);
-  if (fs.existsSync(target)) return false;
-  const { live, prev } = sessionBackupPaths(dirs);
-  for (const backup of [live, prev]) {
-    if (!fs.existsSync(backup)) continue;
-    try {
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      await runCommand('cp', ['-a', backup, target]);
-      return true;
-    } catch (_e) {
-      /* 尝试上一份快照 */
+
+  if (!globalState.valid) {
+    for (const report of backupReports) {
+      try {
+        await replaceDirAtomically(report.path, global, (dir) => inspectGlobalSnapshot(dir).valid);
+        noteRecovery(account, {
+          ...baseRecord,
+          snapshotSource: report.name,
+          snapshotAt: report.verifiedAt,
+          snapshotSize: report.size,
+          restoreAttempted: true,
+          restoreAction: 'restore-global',
+          restoreResult: 'success',
+          error: '',
+        });
+        return true;
+      } catch (err) {
+        noteRecovery(account, {
+          ...baseRecord,
+          snapshotSource: report.name,
+          snapshotAt: report.verifiedAt,
+          snapshotSize: report.size,
+          restoreAttempted: true,
+          restoreAction: 'restore-global',
+          restoreResult: 'failed',
+          error: err.message,
+        });
+      }
     }
   }
+
+  noteRecovery(account, {
+    ...baseRecord,
+    restoreAttempted: false,
+    restoreAction: 'none',
+    restoreResult: ntState.valid ? 'existing-nt_qq' : 'no-valid-snapshot',
+    error: '',
+  });
   return false;
 }
 
 /* ------------------------- 登录成功后的完整快照 ------------------------- */
 
-function goodSessionDir(dirs) {
-  return path.join(dirs.root, 'session-good');
+async function snapshotGoodLogin(account, options = {}) {
+  return withAccountLock(account, () => snapshotGoodLoginUnlocked(account, options));
 }
 
-/** 登录成功时才做：整份 nt_qq 快照，重启后可直接快速登录，不必重新扫码。 */
-async function snapshotGoodLogin(account) {
+/** 只有 WebUI 权威确认 isLogin=true 时才做完整快照，未验证的数据绝不覆盖旧 good。 */
+async function snapshotGoodLoginUnlocked(account, { verified = false, uin = '' } = {}) {
   const dirs = accountDirs(account);
   const src = path.join(dirs.qqData, 'nt_qq');
-  if (!fs.existsSync(src)) return false;
-  const target = goodSessionDir(dirs);
-  const staging = `${target}.new`;
+  const paths = goodSessionPaths(dirs);
+  if (!verified) {
+    noteRecovery(account, {
+      phase: 'snapshot',
+      snapshotFound: false,
+      snapshotAt: 0,
+      snapshotSize: 0,
+      restoreAction: 'snapshot-skip',
+      restoreResult: 'skipped',
+      webuiIsLogin: false,
+      error: 'WebUI 未确认 isLogin=true，不生成/不覆盖 good 快照',
+    });
+    return false;
+  }
+  const sourceState = inspectNtSnapshot(src);
+  if (!sourceState.valid) {
+    noteRecovery(account, {
+      phase: 'snapshot',
+      snapshotFound: false,
+      snapshotAt: 0,
+      snapshotSize: 0,
+      restoreAction: 'snapshot-skip',
+      restoreResult: 'failed',
+      webuiIsLogin: true,
+      error: '当前 nt_qq 缺少可用 global 数据，未生成快照',
+    });
+    return false;
+  }
+  const staging = `${paths.live}.${crypto.randomBytes(6).toString('hex')}.new`;
   try {
     fs.rmSync(staging, { recursive: true, force: true });
-    try {
-      // fnOS 用 btrfs，reflink 快照几乎不占空间、瞬间完成。
-      await runCommand('cp', ['-a', '--reflink=auto', src, staging]);
-    } catch (_e) {
-      fs.rmSync(staging, { recursive: true, force: true });
-      await runCommand('cp', ['-a', src, staging]);
+    await copyDir(src, staging);
+    if (!inspectNtSnapshot(staging).valid) throw new Error('快照复制后校验失败');
+    const size = await measureDirSize(staging);
+    let rotated = false;
+    if (fs.existsSync(paths.live)) {
+      fs.rmSync(paths.prev, { recursive: true, force: true });
+      fs.rmSync(paths.prevMeta, { force: true });
+      fs.renameSync(paths.live, paths.prev);
+      if (fs.existsSync(paths.liveMeta)) fs.renameSync(paths.liveMeta, paths.prevMeta);
+      rotated = true;
     }
-    fs.rmSync(target, { recursive: true, force: true });
-    fs.renameSync(staging, target);
+    try {
+      fs.renameSync(staging, paths.live);
+    } catch (err) {
+      if (rotated) {
+        try {
+          fs.renameSync(paths.prev, paths.live);
+          if (fs.existsSync(paths.prevMeta)) fs.renameSync(paths.prevMeta, paths.liveMeta);
+        } catch (_restoreErr) {
+          throw new Error(`${err.message}；上一代快照暂存在 ${paths.prev}`);
+        }
+      }
+      throw err;
+    }
+    const verifiedAt = Date.now();
+    writeSnapshotMeta(paths.live, {
+      version: 1,
+      uin: String(uin || account.qq || ''),
+      verifiedAt,
+      createdAt: verifiedAt,
+      size,
+      source: 'webui',
+    });
+    noteRecovery(account, {
+      phase: 'snapshot',
+      snapshotFound: true,
+      snapshotAt: verifiedAt,
+      snapshotSize: size,
+      snapshotSource: 'session-good',
+      restoreAttempted: true,
+      restoreAction: 'snapshot-good',
+      restoreResult: 'success',
+      webuiIsLogin: true,
+      error: '',
+    });
     return true;
-  } catch (_e) {
+  } catch (err) {
     fs.rmSync(staging, { recursive: true, force: true });
+    noteRecovery(account, {
+      phase: 'snapshot',
+      snapshotFound: false,
+      snapshotAt: 0,
+      snapshotSize: 0,
+      restoreAttempted: true,
+      restoreAction: 'snapshot-good',
+      restoreResult: 'failed',
+      webuiIsLogin: true,
+      error: err.message,
+    });
     return false;
   }
 }
 
 function hasGoodLogin(account) {
-  return fs.existsSync(goodSessionDir(accountDirs(account)));
+  const paths = goodSessionPaths(accountDirs(account));
+  return inspectNtSnapshot(paths.live).valid || inspectNtSnapshot(paths.prev).valid;
 }
 
-/** 用登录快照覆盖 QQ 数据后重启，让 QQ 直接快速登录，不再要求扫码。 */
+/** 用登录快照覆盖 QQ 数据后重启；当前数据先复制校验，失败不动原目录，可用上一代回退。 */
 async function restoreGoodLogin(account) {
-  const dirs = accountDirs(account);
-  const src = goodSessionDir(dirs);
-  if (!fs.existsSync(src)) return false;
-  // 恢复前不能再拿当前（可能已损坏）的数据覆盖快照。
-  await stopAccount(account, { preserveDesired: true, snapshotGood: false });
-  const target = path.join(dirs.qqData, 'nt_qq');
-  fs.rmSync(target, { recursive: true, force: true });
-  fs.mkdirSync(dirs.qqData, { recursive: true });
-  await runCommand('cp', ['-a', src, target]);
-  return startAccount(account);
+  return withAccountLock(account, () => restoreGoodLoginUnlocked(account));
 }
 
-async function stopAccount(account, { preserveDesired = false, snapshotGood = true } = {}) {
+async function restoreGoodLoginUnlocked(account) {
+  const dirs = accountDirs(account);
+  const paths = goodSessionPaths(dirs);
+  const candidates = [];
+  for (const [name, dir] of [
+    ['session-good', paths.live],
+    ['session-good.prev', paths.prev],
+  ]) {
+    const report = await describeSnapshot(dir, true);
+    if (report.valid) candidates.push({ name, ...report });
+  }
+  if (!candidates.length) {
+    noteRecovery(account, {
+      phase: 'restore',
+      snapshotFound: false,
+      restoreAttempted: false,
+      restoreAction: 'restore-good',
+      restoreResult: 'no-snapshot',
+      error: '没有可用的 good 快照',
+    });
+    return false;
+  }
+  const source = candidates[0];
+  noteRecovery(account, {
+    phase: 'restore',
+    snapshotFound: true,
+    snapshotAt: source.verifiedAt,
+    snapshotSize: source.size,
+    snapshotSource: source.name,
+    restoreAttempted: true,
+    restoreAction: 'restore-good',
+    restoreResult: 'running',
+    error: '',
+  });
+  await stopAccountUnlocked(account, { preserveDesired: true, snapshotGood: false });
+  const target = path.join(dirs.qqData, 'nt_qq');
+  let lastError = null;
+  for (const candidate of candidates) {
+    try {
+      await replaceDirAtomically(candidate.path, target, (dir) => inspectNtSnapshot(dir).valid);
+      noteRecovery(account, {
+        phase: 'restore',
+        snapshotFound: true,
+        snapshotAt: candidate.verifiedAt,
+        snapshotSize: candidate.size,
+        snapshotSource: candidate.name,
+        restoreAttempted: true,
+        restoreAction: 'restore-good',
+        restoreResult: 'success',
+        error: '',
+      });
+      return startAccountUnlocked(account);
+    } catch (err) {
+      lastError = err;
+      noteRecovery(account, {
+        phase: 'restore',
+        snapshotFound: true,
+        snapshotAt: candidate.verifiedAt,
+        snapshotSize: candidate.size,
+        snapshotSource: candidate.name,
+        restoreAttempted: true,
+        restoreAction: 'restore-good',
+        restoreResult: 'failed',
+        error: err.message,
+      });
+    }
+  }
+  throw new Error(`登录快照恢复失败：${lastError ? lastError.message : '未知错误'}`);
+}
+
+async function stopAccount(account, options = {}) {
+  return withAccountLock(account, () => stopAccountUnlocked(account, options));
+}
+
+async function stopAccountUnlocked(account, { preserveDesired = false, snapshotGood = true } = {}) {
   if (!preserveDesired) account.desiredState = 'stopped';
   const dirs = accountDirs(account);
-  const wasOnline = Boolean(account.stats && account.stats.online);
-  // 先快照登录态再停进程，防止强杀/断电导致票据损坏后无法自动重登。
-  await backupSessionState(dirs);
   const candidate = readPid(account) || Number(account.pid) || 0;
   const pid = candidate && processBelongsToHome(candidate, dirs.home) ? candidate : 0;
   const homePids = findPidsByHome(dirs.home);
   const pids = Array.from(new Set([pid, ...homePids].filter(Boolean)));
+  const wasRunning = pids.some((item) => isAlive(item));
 
-  for (const item of pids) await killProcessGroup(item);
+  // 停号前用 WebUI 权威确认在线，只有确认 isLogin=true 才允许生成 good 快照。
+  let verifiedOnline = false;
+  let uin = String(account.qq || '');
+  if (wasRunning && snapshotGood && Number(account.webuiPort)) {
+    const login = await getWebuiLoginStatus(account, 5000);
+    verifiedOnline = Boolean(login && login.isLogin);
+    if (login && login.info) uin = String(login.info.uin || login.info.user_id || uin);
+    appendAccountLog(
+      account,
+      `停号前 WebUI 登录检查：${login ? `isLogin=${login.isLogin} isOffline=${login.isOffline}` : 'WebUI 无响应'}`
+    );
+    noteRecovery(account, {
+      phase: 'stop',
+      webuiIsLogin: login ? login.isLogin : null,
+      snapshotFound: verifiedOnline,
+      error: verifiedOnline ? '' : '停号前 WebUI 未确认在线',
+    });
+  }
+
+  // 先快照 global 再停进程，防止强杀/断电导致票据损坏后无法自动重登。
+  await backupSessionState(dirs);
+
   if (pids.length) {
+    expectedExits.set(account.id, pid || Number(account.pid) || pids[0]);
+    for (const item of pids) await killProcessGroup(item);
     // 给足 10 秒让 QQ 把登录态写盘，尽量避免走到 SIGKILL。
     const gone = await waitGone(pids, 10000);
     if (!gone) {
@@ -743,8 +1367,26 @@ async function stopAccount(account, { preserveDesired = false, snapshotGood = tr
       await waitGone(pids, 2000);
     }
   }
-  // 在线账号正常停止后会写盘，此时再做一份完整快照最干净，重启可免扫码。
-  if (wasOnline && snapshotGood) await snapshotGoodLogin(account);
+
+  // 在线账号正常停止后会写盘，此时再做一份完整快照最干净。
+  if (snapshotGood) {
+    if (verifiedOnline) {
+      await snapshotGoodLoginUnlocked(account, { verified: true, uin });
+    } else {
+      noteRecovery(account, {
+        phase: 'stop',
+        snapshotFound: false,
+        snapshotAt: 0,
+        snapshotSize: 0,
+        restoreAction: 'snapshot-skip',
+        restoreResult: 'skipped',
+        webuiIsLogin: null,
+        error: wasRunning ? 'WebUI 未确认 isLogin=true，跳过 good 快照' : '进程未运行，跳过 good 快照',
+      });
+    }
+  }
+
+  expectedExits.delete(account.id);
   try {
     fs.rmSync(dirs.pidFile, { force: true });
   } catch (_e) {
@@ -752,13 +1394,27 @@ async function stopAccount(account, { preserveDesired = false, snapshotGood = tr
   }
   account.pid = 0;
   account.containerState = 'exited';
+  if (account.stats) account.stats.online = false;
   return { ok: true };
 }
 
 async function restartAccount(account) {
-  await stopAccount(account);
+  return withAccountLock(account, () => restartAccountUnlocked(account));
+}
+
+async function restartAccountUnlocked(account) {
+  await stopAccountUnlocked(account);
   await sleep(800);
-  return startAccount(account);
+  return startAccountUnlocked(account);
+}
+
+/** 重建运行环境但保留 home 下的登录数据，整段在同一把账号锁内完成。 */
+async function recreateAccount(account) {
+  return withAccountLock(account, async () => {
+    await stopAccountUnlocked(account);
+    fs.rmSync(accountDirs(account).napcat, { recursive: true, force: true });
+    return startAccountUnlocked(account);
+  });
 }
 
 async function statusAccount(account) {
@@ -883,6 +1539,23 @@ function extractQrcode(data) {
   );
 }
 
+async function getWebuiLoginStatus(account, timeout = 5000) {
+  try {
+    const status = await webuiPost(account, '/api/QQLogin/CheckLoginStatus', {}, timeout);
+    if (!status || status.code !== 0) return null;
+    const data = status.data || {};
+    return {
+      isLogin: Boolean(data.isLogin),
+      isOffline: Boolean(data.isOffline),
+      phase: data.loginPhase || '',
+      error: data.loginError || '',
+      info: null,
+    };
+  } catch (_e) {
+    return null;
+  }
+}
+
 async function getWebuiLoginState(account) {
   const status = await webuiPost(account, '/api/QQLogin/CheckLoginStatus');
   if (!status || status.code !== 0) {
@@ -925,23 +1598,41 @@ async function getWebuiLoginState(account) {
  * 此时只有丢掉旧票据才能让 QQ 重新生成二维码。
  */
 async function resetLoginState(account) {
-  await stopAccount(account, { preserveDesired: true, snapshotGood: false });
-  const dirs = accountDirs(account);
-  const { live, prev } = sessionBackupPaths(dirs);
-  // 旧快照同样是被踢的票据，必须一并清掉，否则下次启动又会被恢复。
-  fs.rmSync(live, { recursive: true, force: true });
-  fs.rmSync(prev, { recursive: true, force: true });
-  fs.rmSync(goodSessionDir(dirs), { recursive: true, force: true });
-  const stale = path.join(dirs.root, 'session-stale');
-  fs.rmSync(stale, { recursive: true, force: true });
-  try {
-    const src = sessionGlobalDir(dirs);
-    if (fs.existsSync(src)) fs.renameSync(src, stale);
-  } catch (_e) {
-    fs.rmSync(sessionGlobalDir(dirs), { recursive: true, force: true });
-  }
-  await sleep(600);
-  return startAccount(account);
+  return withAccountLock(account, async () => {
+    await stopAccountUnlocked(account, { preserveDesired: true, snapshotGood: false });
+    const dirs = accountDirs(account);
+    const backupPaths = sessionBackupPaths(dirs);
+    const goodPaths = goodSessionPaths(dirs);
+    // 旧快照同样是被踢的票据，必须一并清掉，否则下次启动又会被恢复。
+    fs.rmSync(backupPaths.live, { recursive: true, force: true });
+    fs.rmSync(backupPaths.prev, { recursive: true, force: true });
+    fs.rmSync(backupPaths.staging, { recursive: true, force: true });
+    fs.rmSync(goodPaths.live, { recursive: true, force: true });
+    fs.rmSync(goodPaths.prev, { recursive: true, force: true });
+    fs.rmSync(goodPaths.liveMeta, { force: true });
+    fs.rmSync(goodPaths.prevMeta, { force: true });
+    const stale = path.join(dirs.root, 'session-stale');
+    fs.rmSync(stale, { recursive: true, force: true });
+    try {
+      const src = sessionGlobalDir(dirs);
+      if (fs.existsSync(src)) fs.renameSync(src, stale);
+    } catch (_e) {
+      fs.rmSync(sessionGlobalDir(dirs), { recursive: true, force: true });
+    }
+    noteRecovery(account, {
+      phase: 'reset',
+      snapshotFound: false,
+      snapshotAt: 0,
+      snapshotSize: 0,
+      restoreAttempted: true,
+      restoreAction: 'reset-login',
+      restoreResult: 'success',
+      webuiIsLogin: false,
+      error: '',
+    });
+    await sleep(600);
+    return startAccountUnlocked(account);
+  });
 }
 
 async function refreshQrcode(account) {
@@ -967,6 +1658,13 @@ module.exports = {
   startAccount,
   stopAccount,
   restartAccount,
+  recreateAccount,
+  ensureRestartGuard,
+  resetRestartGuard,
+  noteRestartAttempt,
+  noteRestartFailure,
+  canAutoRestart,
+  noteRecovery,
   backupSessionState,
   restoreSessionStateIfMissing,
   statusAccount,
@@ -976,6 +1674,7 @@ module.exports = {
   writeOnebotConfig,
   ensureAccountOnebotConfig,
   getWebuiLoginState,
+  getWebuiLoginStatus,
   refreshQrcode,
   resetLoginState,
   snapshotGoodLogin,

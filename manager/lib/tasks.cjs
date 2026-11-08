@@ -75,9 +75,7 @@ class TaskEngine {
     this.locks = new Map();
     this.lastKeepalive = new Map();
     this.lastContainerSync = 0;
-    this.keepaliveFails = new Map();
     this.lastGoodSnapshot = new Map();
-    this.restartAttempts = new Map();
     this.replyCooldowns = new Map();
     this.attempts = new Map();
     this.ticking = false;
@@ -133,10 +131,23 @@ class TaskEngine {
           if (status.running) continue;
           const autoRestart = this.store.settings.autoRestart !== false;
           if (account.desiredState === 'running' && autoRestart && napcat.isRuntimeReady()) {
-            this.logger.warn('NapCat 未运行，尝试启动', this.meta(account));
+            if (!napcat.canAutoRestart(account)) {
+              const guard = napcat.ensureRestartGuard(account);
+              this.logger.info(
+                guard.suspended ? '账号自动重启已暂停' : '账号自动重启退避中',
+                this.meta(account)
+              );
+              continue;
+            }
+            const guard = napcat.noteRestartAttempt(account);
+            this.store.save();
+            this.logger.warn(`NapCat 未运行，尝试启动（第 ${guard.attempts} 次）`, this.meta(account));
             try {
               await napcat.startAccount(account);
             } catch (err) {
+              const failed = napcat.noteRestartFailure(account);
+              if (guard.attempts > MAX_KEEPALIVE_RESTARTS) failed.suspended = true;
+              this.store.save();
               this.logger.error(`自动启动 NapCat 失败：${err.message}`, this.meta(account));
             }
           }
@@ -220,32 +231,41 @@ class TaskEngine {
     }
 
     if (webui) {
-      if (!webui.isLogin) return { online: false, confirmed: true, source: 'webui' };
+      if (!webui.isLogin) return { online: false, confirmed: true, source: 'webui', webuiConfirmed: false };
       if (!info || !info.user_id) {
         const uin = webui.info && (webui.info.uin || webui.info.user_id);
         info = { user_id: uin, nickname: webui.info && (webui.info.nickname || webui.info.nick) };
       }
-      return { online: true, info, source: onebotOnline ? 'onebot' : 'webui' };
+      return { online: true, info, source: onebotOnline ? 'onebot' : 'webui', webuiConfirmed: true };
     }
-    if (onebotOnline) return { online: true, info, source: 'onebot' };
-    return { online: false, confirmed: false, error: onebotError, source: 'unreachable' };
+    if (onebotOnline) return { online: true, info, source: 'onebot', webuiConfirmed: false };
+    return { online: false, confirmed: false, error: onebotError, source: 'unreachable', webuiConfirmed: false };
   }
 
   async runKeepalive(account, task) {
+    if (account.desiredState !== 'running') {
+      return { ok: false, message: '账号已停止，跳过保活' };
+    }
     const client = this.clientFor(account);
     const probe = await this.probeOnline(account, client);
 
     if (probe.online) {
       const wasOnline = account.stats.online;
       this.store.recordOnline(account, probe.info && probe.info.user_id, probe.info && probe.info.nickname);
-      this.keepaliveFails.set(account.id, 0);
-      this.restartAttempts.set(account.id, 0);
+      napcat.resetRestartGuard(account);
       account.containerState = 'running';
-      // 在线时每 6 小时留一份完整登录快照，异常断电后还能免扫码恢复。
+      napcat.noteRecovery(account, {
+        phase: 'keepalive',
+        webuiIsLogin: probe.webuiConfirmed ? true : null,
+        error: '',
+      });
+      // 只有 WebUI 权威确认 isLogin=true 时才允许刷新完整登录快照。
       const lastSnap = this.lastGoodSnapshot.get(account.id) || 0;
-      if (Date.now() - lastSnap > 6 * 60 * 60 * 1000) {
+      if (probe.webuiConfirmed && Date.now() - lastSnap > 6 * 60 * 60 * 1000) {
         this.lastGoodSnapshot.set(account.id, Date.now());
-        napcat.snapshotGoodLogin(account).catch(() => {});
+        napcat
+          .snapshotGoodLogin(account, { verified: true, uin: probe.info && probe.info.user_id })
+          .catch((err) => this.logger.error(`生成登录快照失败：${err.message}`, this.meta(account)));
       }
       if (!wasOnline) {
         this.logger.info(`账号已在线：${probe.info && probe.info.nickname ? probe.info.nickname : account.qq || ''}`, this.meta(account));
@@ -261,6 +281,11 @@ class TaskEngine {
     // 进程刚启动，NapCat 还在初始化或自动重登，宽限期内只观察不计失败。
     const startedAt = Number(account.startedAt) || 0;
     if (startedAt && Date.now() - startedAt < STARTUP_GRACE_MS) {
+      napcat.noteRecovery(account, {
+        phase: 'keepalive',
+        webuiIsLogin: probe.source === 'webui' ? false : null,
+        error: '启动宽限期内',
+      });
       return { ok: false, message: '启动宽限期内，暂不判定' };
     }
 
@@ -272,58 +297,110 @@ class TaskEngine {
       this.store.recordOffline(account);
       this.fireNotify(account, 'offline');
     }
-    const fails = (this.keepaliveFails.get(account.id) || 0) + 1;
-    this.keepaliveFails.set(account.id, fails);
+    const guard = napcat.ensureRestartGuard(account);
+    guard.failures = Number(guard.failures || 0) + 1;
+    guard.updatedAt = Date.now();
+    const fails = guard.failures;
+    napcat.noteRecovery(account, {
+      phase: 'keepalive',
+      webuiIsLogin: probe.source === 'webui' ? false : null,
+      error: reason,
+    });
+    this.store.save();
     if (fails === 1) {
       this.logger.warn(`保活探测失败：${reason}`, this.meta(account));
     }
     if (fails < Math.max(1, Number(task.failThreshold) || 2) || !task.autoRestart) {
       return { ok: false, message: reason };
     }
-    this.keepaliveFails.set(account.id, 0);
+    guard.failures = 0;
+    guard.updatedAt = Date.now();
     this.store.recordOffline(account);
 
     // 未完成首次登录的账号没有会话可恢复，重启只会打断正在进行的扫码登录。
     if (!account.qq) {
       this.logger.warn('账号尚未完成首次登录，跳过自动重启，等待扫码', this.meta(account));
+      this.store.save();
       return { ok: false, message: '账号未登录，等待扫码' };
     }
     // 用户正在弹窗里扫码重登：重启进程会作废刚生成的二维码、打断登录。
     if (account.qrSessionAt && Date.now() - Number(account.qrSessionAt) < QR_SESSION_PROTECT_MS) {
       this.logger.info('扫码登录进行中，暂停自动重启', this.meta(account));
+      this.store.save();
       return { ok: false, message: '扫码登录进行中，暂停自动重启' };
     }
-    // 快速登录失效（票据损坏/被清理）时，用登录成功后的完整快照覆盖并重启，
-    // 让 QQ 直接快速登录，不再要求重新扫码。30 分钟内只尝试一次，避免死循环。
+    if (!napcat.canAutoRestart(account)) {
+      const wait = Number(guard.nextRetryAt || 0) - Date.now();
+      this.logger.info(
+        guard.suspended
+          ? '账号已暂停自动重启，等待人工处理'
+          : `自动重启退避中，约 ${Math.max(0, Math.ceil(wait / 1000))} 秒后再试`,
+        this.meta(account)
+      );
+      this.store.save();
+      return { ok: false, message: guard.suspended ? '自动重启已暂停' : '自动重启退避中' };
+    }
+
+    // 快速登录失效（票据损坏/被清理）时，用登录成功后的完整快照覆盖并重启。
+    // 30 分钟内只尝试一次，避免死循环。
     const lastRestore = Number(account.loginRestoreAt) || 0;
     if (napcat.hasGoodLogin(account) && Date.now() - lastRestore > 30 * 60 * 1000) {
+      const restoreGuard = napcat.noteRestartAttempt(account);
+      if (restoreGuard.attempts > MAX_KEEPALIVE_RESTARTS) {
+        restoreGuard.suspended = true;
+        account.lastError = '连续尝试登录快照恢复仍未在线，可能需要重新扫码或账号被风控';
+        this.store.save();
+        this.logger.warn('登录快照恢复次数已达上限，已暂停自动重启', this.meta(account));
+        return { ok: false, message: '登录快照恢复次数已达上限，已暂停自动重启' };
+      }
       account.loginRestoreAt = Date.now();
+      this.store.save();
       try {
-        await napcat.restoreGoodLogin(account);
-        this.keepaliveFails.set(account.id, 0);
+        const restored = await napcat.restoreGoodLogin(account);
+        if (!restored) throw new Error('没有可用的登录快照');
+        const current = napcat.ensureRestartGuard(account);
+        current.failures = 0;
+        current.nextRetryAt = Date.now() + 45000;
+        current.updatedAt = Date.now();
+        this.store.save();
         this.lastKeepalive.set(account.id, Date.now() + 45000);
         this.logger.warn('快速登录失效，已用登录快照恢复，正在自动重新登录', this.meta(account));
         return { ok: false, message: '已用登录快照恢复，正在自动重新登录' };
       } catch (e) {
+        napcat.noteRestartFailure(account);
         this.logger.error(`用登录快照恢复失败：${e.message}`, this.meta(account));
+        this.store.save();
+        return { ok: false, message: `登录快照恢复失败，退避后重试：${e.message}` };
       }
     }
+
     // 重启退避：连续多次重启仍不在线，说明会话无法自愈（多为风控或需重扫码），
     // 继续重启只会加剧风控，暂停自动重启并提示人工处理。
-    const attempts = (this.restartAttempts.get(account.id) || 0) + 1;
-    this.restartAttempts.set(account.id, attempts);
-    if (attempts > MAX_KEEPALIVE_RESTARTS) {
+    const attempts = napcat.noteRestartAttempt(account);
+    if (attempts.attempts > MAX_KEEPALIVE_RESTARTS) {
+      attempts.suspended = true;
       account.lastError = '连续重启后仍未恢复在线，可能需要重新扫码或账号被风控';
       this.store.save();
       this.logger.warn('连续重启仍未恢复在线，已暂停自动重启，请检查账号状态', this.meta(account));
       return { ok: false, message: '连续重启未恢复，已暂停自动重启' };
     }
-    this.logger.warn(`连续探测失败，正在重启 NapCat（第 ${attempts}/${MAX_KEEPALIVE_RESTARTS} 次）`, this.meta(account));
+    this.store.save();
+    this.logger.warn(`连续探测失败，正在重启 NapCat（第 ${attempts.attempts}/${MAX_KEEPALIVE_RESTARTS} 次）`, this.meta(account));
     try {
       await napcat.restartAccount(account);
+      napcat.noteRecovery(account, {
+        phase: 'restart',
+        restoreAction: 'restart-napcat',
+        restoreResult: 'success',
+        webuiIsLogin: null,
+        error: '',
+      });
       this.lastKeepalive.set(account.id, Date.now() + 30000);
       return { ok: false, message: '探测失败，已重启 NapCat（登录态已快照保留）' };
     } catch (e) {
+      const failed = napcat.noteRestartFailure(account);
+      if (attempts.attempts > MAX_KEEPALIVE_RESTARTS) failed.suspended = true;
+      this.store.save();
       this.logger.error(`重启 NapCat 失败：${e.message}`, this.meta(account));
       return { ok: false, message: `探测失败，重启也失败：${e.message}` };
     }

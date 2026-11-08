@@ -19,6 +19,7 @@ const PORT = Number(process.env.PORT) || 8787;
 const HOST = process.env.HOST || '0.0.0.0';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const MOCK = process.env.QQNAS_MOCK === '1';
+const MAX_AUTO_RESTARTS = 3;
 
 /** 访问密码优先取环境变量，其次读取数据目录下的 access-password（飞牛应用安装向导写入）。 */
 function loadAccessPassword() {
@@ -310,6 +311,8 @@ function publicAccount(account) {
     onebotPort: account.onebotPort,
     webuiToken: account.webuiToken,
     lastError: account.lastError || '',
+    autoRestartGuard: account.autoRestartGuard || null,
+    loginRecovery: account.loginRecovery || null,
     tasks: account.tasks,
     stats: {
       online: Boolean(account.stats && account.stats.online),
@@ -737,6 +740,7 @@ async function createAccount({ alias, owner }) {
   account.desiredState = 'running';
   account.containerState = 'preparing';
   napcat.ensureAccountDirs(account);
+  napcat.resetRestartGuard(account);
   store.add(account);
   logger.info(`正在准备账号运行环境 ${account.alias}`, { accountId: account.id, account: account.alias });
 
@@ -746,11 +750,11 @@ async function createAccount({ alias, owner }) {
     return account;
   }
 
-  startAccountInBackground(account);
+  startAccountInBackground(account, { auto: false });
   return account;
 }
 
-function startAccountInBackground(account) {
+function startAccountInBackground(account, { auto = true } = {}) {
   if (starting.has(account.id)) return;
   starting.add(account.id);
   napcat
@@ -762,6 +766,13 @@ function startAccountInBackground(account) {
       logger.error(`启动 NapCat 失败：${err.message}`, { accountId: account.id, account: account.alias });
       account.containerState = 'error';
       account.lastError = err.message;
+      if (auto) {
+        const guard = napcat.noteRestartFailure(account);
+        if (guard.attempts > MAX_AUTO_RESTARTS) {
+          guard.suspended = true;
+          account.lastError = `${err.message}（连续 ${guard.attempts} 次启动失败，已暂停自动重启）`;
+        }
+      }
       store.save();
     })
     .finally(() => {
@@ -1080,6 +1091,7 @@ async function handleApi(req, res, url) {
       if (!MOCK) {
         if (action === 'start') {
           account.desiredState = 'running';
+          napcat.resetRestartGuard(account);
           await napcat.startAccount(account);
         }
         if (action === 'stop') {
@@ -1088,13 +1100,13 @@ async function handleApi(req, res, url) {
         }
         if (action === 'restart') {
           account.desiredState = 'running';
+          napcat.resetRestartGuard(account);
           await napcat.restartAccount(account);
         }
         if (action === 'recreate') {
           account.desiredState = 'running';
-          await napcat.stopAccount(account);
-          fs.rmSync(napcat.accountDirs(account).napcat, { recursive: true, force: true });
-          await napcat.startAccount(account);
+          napcat.resetRestartGuard(account);
+          await napcat.recreateAccount(account);
         }
         const status = await napcat.statusAccount(account);
         if (action === 'stop') account.containerState = 'exited';
@@ -1138,7 +1150,10 @@ async function handleApi(req, res, url) {
       }
       const info = await napcat.statusAccount(account);
       if (!info.running) {
-        if (account.desiredState === 'running') startAccountInBackground(account);
+        if (account.desiredState === 'running') {
+          napcat.resetRestartGuard(account);
+          startAccountInBackground(account, { auto: false });
+        }
         return json(res, 200, {
           ready: false,
           isLogin: false,
@@ -1501,7 +1516,17 @@ async function supervise() {
       if (!napcat.isRuntimeReady()) continue;
       const status = await napcat.statusAccount(account);
       if (account.desiredState === 'running' && !status.running && !starting.has(account.id)) {
-        startAccountInBackground(account);
+        if (!napcat.canAutoRestart(account)) {
+          // 暂停/退避状态已由保活和启动失败路径记录，避免每 8 秒重复刷日志。
+          continue;
+        }
+        const guard = napcat.noteRestartAttempt(account);
+        changed = true;
+        logger.warn(`NapCat 未运行，自动重启（第 ${guard.attempts}/${MAX_AUTO_RESTARTS} 次）`, {
+          accountId: account.id,
+          account: account.alias,
+        });
+        startAccountInBackground(account, { auto: true });
       }
     }
 
@@ -1545,6 +1570,35 @@ async function bootstrap() {
 
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+
+let fatalExitScheduled = false;
+
+process.on('uncaughtException', (err) => {
+  try {
+    logger.error(`未捕获异常：${err && err.stack ? err.stack : err}`);
+  } catch (_e) {
+    /* ignore */
+  }
+  try {
+    store.saveNow();
+  } catch (_e) {
+    /* ignore */
+  }
+  if (fatalExitScheduled) return;
+  fatalExitScheduled = true;
+  // 受控退出，交给应用中心/守护进程重新拉起；避免异常状态下继续服务。
+  setTimeout(() => process.exit(1), 300);
+});
+
+process.on('unhandledRejection', (reason) => {
+  const message = reason && reason.stack ? reason.stack : String(reason);
+  try {
+    logger.error(`未处理的 Promise 拒绝：${message}`);
+  } catch (_e) {
+    /* ignore */
+  }
+  // 单个异步任务失败不应拖垮整个管理端；记录后继续运行。
+});
 
 let shuttingDown = false;
 

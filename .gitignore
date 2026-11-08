@@ -42,3 +42,9 @@ preview*.png
 .DS_Store
 Thumbs.db
 node_modules/
+
+# 本地解包中间目录与构建产物（不进仓库）
+2.0.20/
+app.tgz
+/*.fpk
+.trae-html-share-packages/
