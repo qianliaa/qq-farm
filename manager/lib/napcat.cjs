@@ -1151,6 +1151,9 @@ const RECOVERY_DEFAULTS = {
   webuiOfflineHint: false,
   webuiPhase: '',
   loginError: '',
+  offlineCategory: '',
+  offlineCode: '',
+  offlineTitle: '',
   restoreAttempted: false,
   restoreResult: '',
   restoreAction: '',
@@ -1162,7 +1165,14 @@ const RECOVERY_DEFAULTS = {
 
 function noteRecovery(account, patch = {}) {
   const { silent = false, ...data } = patch;
-  account.loginRecovery = { ...RECOVERY_DEFAULTS, ...(account.loginRecovery || {}), ...data, at: Date.now() };
+  const merged = { ...RECOVERY_DEFAULTS, ...(account.loginRecovery || {}), ...data, at: Date.now() };
+  // 归因字段只反映本次判定，不能被上一次掉线的原因残留污染。
+  if (!Object.prototype.hasOwnProperty.call(data, 'offlineTitle')) {
+    merged.offlineCategory = '';
+    merged.offlineCode = '';
+    merged.offlineTitle = '';
+  }
+  account.loginRecovery = merged;
   if (!silent) {
     const record = account.loginRecovery;
     const iso = (value) => (value ? new Date(value).toISOString() : '');
@@ -1189,6 +1199,9 @@ function noteRecovery(account, patch = {}) {
         webuiOfflineHint: Boolean(record.webuiOfflineHint),
         webuiPhase: record.webuiPhase || '',
         loginError: record.loginError || '',
+        offlineCategory: record.offlineCategory || '',
+        offlineCode: record.offlineCode || '',
+        offlineTitle: record.offlineTitle || '',
         restoredAt: iso(record.restoredAt),
         restoreAttempted: record.restoreAttempted,
         restoreAction: record.restoreAction,
@@ -1197,6 +1210,12 @@ function noteRecovery(account, patch = {}) {
         error: record.error || '',
       })}`
     );
+    // 再写一行人能直接看懂的归因，避免每次都要去解读 JSON 诊断行。
+    if (record.offlineTitle) {
+      const labels = { official: '官方问题', software: '软件问题', environment: '环境问题', unknown: '原因待判定' };
+      const label = labels[record.offlineCategory] || '原因待判定';
+      appendAccountLog(account, `掉线原因 ${label} · ${record.offlineTitle}`);
+    }
   }
   return account.loginRecovery;
 }

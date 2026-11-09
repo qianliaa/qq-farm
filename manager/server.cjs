@@ -12,8 +12,9 @@ const { Store, DATA_DIR, createAccountRecord } = require('./lib/store.cjs');
 const { Logger } = require('./lib/logger.cjs');
 const napcat = require('./lib/napcat.cjs');
 const { TaskEngine, TASK_KEYS, TASK_META } = require('./lib/tasks.cjs');
+const { classifyOffline } = require('./lib/offline-reason.cjs');
 
-const APP_VERSION = '2.0.24';
+const APP_VERSION = '2.0.25';
 const UPDATE_REPO = (process.env.QQNAS_UPDATE_REPO || 'qianliaa/qq-online').trim();
 const PORT = Number(process.env.PORT) || 8787;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -53,9 +54,17 @@ async function dispatchNotify(account, kind) {
   const time = new Date().toLocaleString('zh-CN', { hour12: false });
   const offline = kind === 'offline';
   const title = offline ? '【QQ挂机仓】账号掉线提醒' : '【QQ挂机仓】账号已恢复在线';
+  const reason = offline ? account.offlineReason : account.lastOfflineReason;
+  const reasonText = reason
+    ? `\n原因分类：${reason.categoryLabel} · ${reason.title}` +
+      (reason.evidence && reason.evidence.length ? `\n判定依据：${reason.evidence.slice(0, 2).join('；')}` : '') +
+      `\n处理建议：${reason.advice}`
+    : '';
   const text = offline
-    ? `账号「${name}」${account.qq ? `（QQ ${account.qq}）` : ''}已确认离线，请打开面板查看，必要时重新扫码。\n时间：${time}`
-    : `账号「${name}」${account.qq ? `（QQ ${account.qq}）` : ''}已恢复在线。\n时间：${time}`;
+    ? `账号「${name}」${account.qq ? `（QQ ${account.qq}）` : ''}已确认离线。${reasonText}\n时间：${time}`
+    : `账号「${name}」${account.qq ? `（QQ ${account.qq}）` : ''}已恢复在线。${
+        reason ? `\n上次掉线原因：${reason.categoryLabel} · ${reason.title}` : ''
+      }\n时间：${time}`;
   await notifyChannel.send(cfg, title, text);
   logger.info(`已发送${offline ? '掉线' : '恢复'}通知`, { accountId: account.id, account: name });
 }
@@ -313,6 +322,10 @@ function publicAccount(account) {
     lastError: account.lastError || '',
     autoRestartGuard: account.autoRestartGuard || null,
     loginRecovery: account.loginRecovery || null,
+    offlineReason: account.offlineReason || null,
+    lastOfflineReason: account.lastOfflineReason || null,
+    offlineHistory: Array.isArray(account.offlineHistory) ? account.offlineHistory.slice(-5) : [],
+    probeIssue: account.probeIssue || null,
     tasks: account.tasks,
     stats: {
       online: Boolean(account.stats && account.stats.online),
@@ -716,6 +729,14 @@ async function probeAccountOnce(account) {
       onlineDayCount: (account.stats.onlineDays || []).length,
       consecutiveDays: consecutiveDays(account.stats.onlineDays || []),
       runtimeReady: true,
+      // 演示模式给一条官方侧示例，便于直接看到掉线原因卡片的效果。
+      offlineReason: classifyOffline({
+        probe: { confirmed: true, source: 'webui' },
+        health: { running: true, webuiReady: true },
+        kernelLog: '[Core] [Login] Login Error,ErrType: 1 ErrCode: 3\n请扫描下面的二维码，然后在手Q上授权登录',
+      }),
+      lastOfflineReason: null,
+      probeIssue: null,
     };
     statusCache.set(account.id, { at: Date.now(), value });
     return value;
@@ -804,6 +825,10 @@ async function probeAccountOnce(account) {
     ...result,
     onlineDayCount: (account.stats.onlineDays || []).length,
     consecutiveDays: consecutiveDays(account.stats.onlineDays || []),
+    offlineReason: account.offlineReason || null,
+    lastOfflineReason: account.lastOfflineReason || null,
+    offlineHistory: Array.isArray(account.offlineHistory) ? account.offlineHistory.slice(-5) : [],
+    probeIssue: account.probeIssue || null,
   };
   statusCache.set(account.id, { at: Date.now(), value });
   return value;

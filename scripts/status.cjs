@@ -16,6 +16,14 @@ async function main() {
   console.log(`在线：${status.online ? '是' : '否'}`);
   console.log(`状态：${status.status}`);
   console.log(`消息接收：${status.good ? '正常' : '异常'}`);
+  const reason = account && account.offlineReason;
+  if (reason) {
+    console.log(`掉线原因：${reason.categoryLabel} · ${reason.title}`);
+    console.log(`处理建议：${reason.advice}`);
+  } else if (account && account.lastOfflineReason && status.online) {
+    const last = account.lastOfflineReason;
+    console.log(`上次掉线：${last.categoryLabel} · ${last.title}`);
+  }
 }
 
 main().catch(fail);

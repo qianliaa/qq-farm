@@ -501,6 +501,8 @@ function renderSidebar() {
       const active = account.id === state.currentId;
       const online = account.id === state.currentId && state.status ? state.status.online : account.stats && account.stats.online;
       const name = account.nickname || account.alias || 'QQ 账号';
+      const reason = account.offlineReason;
+      const tip = online ? '在线' : reason ? `离线：${reason.categoryLabel} · ${reason.title}` : '离线';
       return `
         <button class="account-item ${active ? 'active' : ''}" data-id="${esc(account.id)}">
           <span class="avatar tiny">${esc(initials(account))}</span>
@@ -508,7 +510,7 @@ function renderSidebar() {
             <b>${esc(account.alias)}</b>
             <small>${account.qq ? `QQ ${esc(account.qq)}` : '未登录'}</small>
           </span>
-          <span class="dot ${online ? 'online' : ''}" title="${online ? '在线' : '离线'}"></span>
+          <span class="dot ${online ? 'online' : ''}" title="${esc(tip)}"></span>
         </button>`;
     })
     .join('');
@@ -575,7 +577,60 @@ function statusMeta(account) {
   const online = status ? status.online : account.stats && account.stats.online;
   if (online) return { cls: 'online', text: '在线' };
   if (!running) return { cls: 'off', text: status ? '已停止' : runtimeText(account.containerState) };
+  const reason = (status && status.offlineReason) || account.offlineReason;
+  if (reason && reason.category === 'official') {
+    return { cls: 'warn', text: reason.code === 'need_scan' ? '需重新扫码' : '官方侧离线' };
+  }
+  if (reason && reason.category === 'software') return { cls: 'warn', text: '本地程序异常' };
+  if (reason && reason.category === 'environment') return { cls: 'warn', text: '环境异常' };
   return { cls: 'warn', text: '待登录' };
+}
+
+/** 掉线原因卡片：离线时显示当前归因，在线时折叠显示「上次掉线原因」。 */
+function renderOfflineReason(account, status) {
+  const panel = $('#offlinePanel');
+  if (!panel) return;
+  const online = status.online !== undefined ? status.online : Boolean(account.stats && account.stats.online);
+  const current = status.offlineReason || account.offlineReason || null;
+  const issue = status.probeIssue || account.probeIssue || null;
+  const last = status.lastOfflineReason || account.lastOfflineReason || null;
+  let reason = null;
+  let resolved = false;
+  if (!online && current) {
+    reason = current;
+  } else if (online && last) {
+    reason = last;
+    resolved = true;
+  } else if (online && issue) {
+    reason = { ...issue, categoryLabel: '探测异常（未确认掉线）', color: 'blue' };
+    resolved = true;
+  }
+  if (!reason) {
+    panel.classList.add('hidden');
+    return;
+  }
+  panel.className = `offline-panel cause-${reason.color || 'muted'}${resolved ? ' resolved' : ''}`;
+  const tag = $('#offlineCategory');
+  tag.className = `cause-tag ${reason.color || 'muted'}`;
+  tag.textContent = reason.categoryLabel || '原因待判定';
+  $('#offlineTitle').textContent = reason.title || '';
+  $('#offlineTime').textContent = resolved
+    ? reason.recoveredAt
+      ? `已恢复 ${fmtDateTime(reason.recoveredAt)}`
+      : '已恢复'
+    : reason.at
+      ? `发生于 ${fmtDateTime(reason.at)}`
+      : '';
+  $('#offlineDetail').textContent = reason.detail || '';
+  $('#offlineAdvice').textContent = reason.advice || '';
+  const evidence = $('#offlineEvidence');
+  const items = Array.isArray(reason.evidence) ? reason.evidence.filter(Boolean) : [];
+  if (items.length) {
+    evidence.classList.remove('hidden');
+    evidence.textContent = `判定依据：\n${items.map((item) => `· ${item}`).join('\n')}`;
+  } else {
+    evidence.classList.add('hidden');
+  }
 }
 
 function updateStatusUI() {
@@ -603,6 +658,7 @@ function updateStatusUI() {
 
   const item = document.querySelector(`.account-item[data-id="${account.id}"] .dot`);
   if (item) item.classList.toggle('online', Boolean(status.online));
+  renderOfflineReason(account, status);
 }
 
 function taskLastNote(key, task) {

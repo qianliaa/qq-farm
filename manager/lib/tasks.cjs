@@ -2,6 +2,7 @@
 
 const { OneBot } = require('../../shared/onebot.cjs');
 const napcat = require('./napcat.cjs');
+const { classifyOffline, describeReason, probeNetworkReachable } = require('./offline-reason.cjs');
 
 const TASK_KEYS = ['keepalive', 'dailyLike', 'groupSign', 'qzonePost', 'broadcast', 'randomActive', 'autoReply'];
 
@@ -107,9 +108,11 @@ class TaskEngine {
   fireNotify(account, kind) {
     if (typeof this.notify !== 'function') return;
     if (kind === 'offline') {
-      const last = this.offlineNotified.get(account.id) || 0;
-      if (Date.now() - last < 30 * 60 * 1000) return;
-      this.offlineNotified.set(account.id, Date.now());
+      const last = this.offlineNotified.get(account.id) || { at: 0, code: '' };
+      const code = (account.offlineReason && account.offlineReason.code) || '';
+      // 同一原因 30 分钟内不重复；原因变了（例如软件故障→需扫码）要重新提醒。
+      if (Date.now() - last.at < 30 * 60 * 1000 && last.code === code) return;
+      this.offlineNotified.set(account.id, { at: Date.now(), code });
     }
     Promise.resolve()
       .then(() => this.notify(account, kind))
@@ -303,6 +306,35 @@ class TaskEngine {
     };
   }
 
+  /**
+   * 掉线归因：汇总进程体检、NapCat 内核日志与外网连通性，
+   * 判定属于官方问题、软件问题还是环境问题。
+   * WebUI 已明确返回未登录时不做外网探测：能读到明确状态说明本机链路是通的。
+   */
+  async diagnoseOffline(account, probe) {
+    let health = { running: true, webuiReady: null };
+    try {
+      health = await napcat.statusAccount(account);
+    } catch (_e) {
+      /* 体检失败按进程存活处理，用其它证据判定 */
+    }
+    let kernelLog = '';
+    try {
+      kernelLog = napcat.getAccountLogs(account, 1500) || '';
+    } catch (_e) {
+      /* 日志不可读不影响其它证据 */
+    }
+    let networkOk = null;
+    if (!probe.confirmed) {
+      try {
+        networkOk = await probeNetworkReachable();
+      } catch (_e) {
+        networkOk = null;
+      }
+    }
+    return { reason: classifyOffline({ probe, health, kernelLog, networkOk }), health };
+  }
+
   async runKeepalive(account, task) {
     if (account.desiredState !== 'running') {
       return { ok: false, message: '账号已停止，跳过保活' };
@@ -400,19 +432,29 @@ class TaskEngine {
     }
 
     const confirmed = Boolean(probe.confirmed);
+    // 先归因再落状态：通知/面板/日志都要用到同一份分类结果。
+    const diagnosis = await this.diagnoseOffline(account, probe);
+    const cause = diagnosis.reason;
     const reason = confirmed
       ? `QQ 当前不在线${probe.phase ? `（阶段 ${probe.phase}）` : ''}${probe.loginError ? `：${probe.loginError}` : ''}`
       : `OneBot 与 WebUI 均无响应${probe.error ? `：${probe.error.message}` : ''}`;
     const guard = napcat.ensureRestartGuard(account);
+    const causeChanged =
+      !account.offlineReason ||
+      account.offlineReason.code !== cause.code ||
+      account.offlineReason.category !== cause.category;
     // 两类失败分开计数：只有「确认离线」才触发快照恢复/重启；
     // 接口不可读说明探测链路本身有问题，急着重启只会制造一次真实掉线。
     if (confirmed) {
       guard.failures = Number(guard.failures || 0) + 1;
       guard.unreachable = 0;
-      this.store.recordOffline(account);
+      this.store.recordOffline(account, cause);
       this.fireNotify(account, 'offline');
+      if (causeChanged) this.logger.warn(`掉线原因判定：${cause.summary}`, this.meta(account));
     } else {
       guard.unreachable = Number(guard.unreachable || 0) + 1;
+      // 未确认掉线：只记录「探测异常」，不伪装成 QQ 掉线原因。
+      this.store.setProbeIssue(account, cause);
     }
     guard.updatedAt = Date.now();
     const fails = confirmed ? guard.failures : guard.unreachable;
@@ -426,6 +468,9 @@ class TaskEngine {
       probeSource: probe.source,
       webuiPhase: probe.phase || '',
       loginError: probe.loginError || '',
+      offlineCategory: cause.category,
+      offlineCode: cause.code,
+      offlineTitle: cause.title,
       error: reason,
     });
     this.store.save();
@@ -436,9 +481,9 @@ class TaskEngine {
       return { ok: false, message: reason };
     }
     if (!confirmed) {
-      // 接口不可读时先体检：进程还活着、WebUI 端口也通，说明只是接口暂时
+      // 接口不可读时先体检（复用归因阶段的结果，不再重复探测）：进程还活着、WebUI 端口也通，说明只是接口暂时
       // 无响应；进程已退出则交给后台巡检拉起，避免两条路径重复重启。
-      const health = await napcat.statusAccount(account);
+      const health = diagnosis.health;
       if (!health.running) {
         this.logger.info('进程已退出，交给后台巡检拉起，避免重复重启', this.meta(account));
         return { ok: false, message: '进程未运行，等待自动拉起' };

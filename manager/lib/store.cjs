@@ -112,6 +112,9 @@ const DEFAULT_LOGIN_RECOVERY = {
   webuiOfflineHint: false,
   webuiPhase: '',
   loginError: '',
+  offlineCategory: '',
+  offlineCode: '',
+  offlineTitle: '',
   restoreAttempted: false,
   restoreAction: '',
   restoreResult: '',
@@ -140,6 +143,10 @@ function createAccountRecord(alias) {
     hookSecret: crypto.randomBytes(16).toString('hex'),
     autoRestartGuard: { ...DEFAULT_RESTART_GUARD },
     loginRecovery: { ...DEFAULT_LOGIN_RECOVERY },
+    offlineReason: null,
+    lastOfflineReason: null,
+    offlineHistory: [],
+    probeIssue: null,
     tasks: defaultTasks(),
     stats: {
       onlineDays: [],
@@ -184,6 +191,11 @@ class Store {
         // 旧 config.json 没有这两个字段，补齐后保持向前兼容。
         account.autoRestartGuard = { ...DEFAULT_RESTART_GUARD, ...(account.autoRestartGuard || {}) };
         account.loginRecovery = { ...DEFAULT_LOGIN_RECOVERY, ...(account.loginRecovery || {}) };
+        // 掉线原因相关字段（旧 config.json 没有，补齐后保持向前兼容）。
+        account.offlineReason = account.offlineReason || null;
+        account.lastOfflineReason = account.lastOfflineReason || null;
+        account.offlineHistory = Array.isArray(account.offlineHistory) ? account.offlineHistory : [];
+        account.probeIssue = account.probeIssue || null;
       }
     } catch (err) {
       const backup = `${CONFIG_FILE}.broken-${Date.now()}`;
@@ -294,6 +306,17 @@ class Store {
     account.stats.lastSeen = now;
     if (userId) account.qq = String(userId);
     if (nickname) account.nickname = nickname;
+    // 恢复在线时把当前掉线原因归档，面板仍可查看「上次掉线原因」。
+    if (account.offlineReason) {
+      const finished = { ...account.offlineReason, recoveredAt: now };
+      account.lastOfflineReason = finished;
+      const history = Array.isArray(account.offlineHistory) ? account.offlineHistory : [];
+      history.push(finished);
+      account.offlineHistory = history.slice(-10);
+      account.offlineReason = null;
+      account.probeIssue = null;
+      this.save();
+    }
     const day = formatDate(new Date());
     if (!account.stats.onlineDays.includes(day)) {
       account.stats.onlineDays.push(day);
@@ -302,7 +325,31 @@ class Store {
     }
   }
 
-  recordOffline(account) {
+  /** 记录确认掉线的原因；同一原因反复出现时只更新核查时间，不刷历史。 */
+  setOfflineReason(account, reason) {
+    if (!reason) return null;
+    const prev = account.offlineReason;
+    if (!prev || prev.code !== reason.code || prev.category !== reason.category) {
+      account.offlineReason = reason;
+      const history = Array.isArray(account.offlineHistory) ? account.offlineHistory : [];
+      history.push({ at: reason.at, code: reason.code, category: reason.category, title: reason.title });
+      account.offlineHistory = history.slice(-10);
+    } else {
+      account.offlineReason = { ...reason, at: prev.at, checkedAt: reason.at };
+    }
+    this.save();
+    return account.offlineReason;
+  }
+
+  /** 接口读不到但没确认掉线：单独记录，避免把「探测异常」说成 QQ 掉线。 */
+  setProbeIssue(account, reason) {
+    account.probeIssue = reason ? { ...reason, provisional: true } : null;
+    this.save();
+    return account.probeIssue;
+  }
+
+  recordOffline(account, reason) {
+    if (reason) this.setOfflineReason(account, reason);
     if (account.stats.online) {
       account.stats.online = false;
       this.save();
