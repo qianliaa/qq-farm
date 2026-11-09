@@ -80,7 +80,9 @@ function clone(value) {
 
 const DEFAULT_RESTART_GUARD = {
   suspended: false,
+  suspendedAt: 0,
   failures: 0,
+  unreachable: 0,
   attempts: 0,
   nextRetryAt: 0,
   lastAttemptAt: 0,
@@ -108,6 +110,8 @@ const DEFAULT_LOGIN_RECOVERY = {
   decision: '',
   probeSource: '',
   webuiOfflineHint: false,
+  webuiPhase: '',
+  loginError: '',
   restoreAttempted: false,
   restoreAction: '',
   restoreResult: '',

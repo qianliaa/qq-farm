@@ -13,7 +13,7 @@ const { Logger } = require('./lib/logger.cjs');
 const napcat = require('./lib/napcat.cjs');
 const { TaskEngine, TASK_KEYS, TASK_META } = require('./lib/tasks.cjs');
 
-const APP_VERSION = '2.0.23';
+const APP_VERSION = '2.0.24';
 const UPDATE_REPO = (process.env.QQNAS_UPDATE_REPO || 'qianliaa/qq-online').trim();
 const PORT = Number(process.env.PORT) || 8787;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -444,7 +444,20 @@ const starting = new Set();
  */
 const QRCODE_REFRESH_AFTER = 15 * 1000;
 const QRCODE_STALE_MAX = 5 * 60 * 1000;
+/** 扫码窗口最多保护 15 分钟：弹窗一直开着也不能永久禁止保活自愈。 */
+const QR_SESSION_MAX_MS = 15 * 60 * 1000;
 const qrcodeCache = new Map();
+
+/**
+ * 记录一次扫码窗口。旧实现每 3 秒续一次 qrSessionAt，用户只要开着登录弹窗，
+ * 保活就永远不会自动重启，掉线后只能等人处理；这里给保护窗口设总上限。
+ */
+function markQrSession(account) {
+  const now = Date.now();
+  const start = Number(account.qrSessionStart) || 0;
+  if (!start || now - start > QR_SESSION_MAX_MS) account.qrSessionStart = now;
+  if (now - Number(account.qrSessionStart) < QR_SESSION_MAX_MS) account.qrSessionAt = now;
+}
 
 function cacheQrState(accountId, webui) {
   const existing = qrcodeCache.get(accountId);
@@ -457,6 +470,7 @@ function cacheQrState(accountId, webui) {
     phase: webui.phase || '',
     error: webui.error || '',
     info: webui.info || null,
+    transient: Boolean(webui.transient),
     at: Date.now(),
     freshAt: webui.fetchedAt || Date.now(),
     refreshing: false,
@@ -543,6 +557,9 @@ function delay(ms) {
 }
 
 function trackQrProgress(account, webui) {
+  // 登录态暂不可读、或内核刚重连：不是「取不到码」，不能累计空码轮次，
+  // 否则会误判成票据失效，把仍然有效的登录态清掉。
+  if (webui.transient) return;
   if (webui.isLogin || webui.qrcode) {
     qrEmptyRounds.delete(account.id);
     return;
@@ -579,7 +596,7 @@ async function waitQrcodeAfterReset(account, timeoutMs = QR_RESET_TIMEOUT) {
     if (!info || !info.webuiReady) continue;
     const webui = await napcat.getWebuiLoginState(account).catch(() => null);
     if (!webui) continue;
-    account.qrSessionAt = Date.now();
+    markQrSession(account);
     if (webui.isLogin || webui.qrcode) {
       cacheQrState(account.id, { ...webui, fetchedAt: Date.now() });
       applyWebuiLogin(account, webui);
@@ -614,7 +631,7 @@ function resetAccountForQrcode(account, { force = false } = {}) {
     accountId: account.id,
     account: account.alias,
   });
-  account.qrSessionAt = Date.now();
+  markQrSession(account);
   napcat
     .resetLoginState(account)
     .then(() => waitQrcodeAfterReset(account))
@@ -770,6 +787,16 @@ async function probeAccountOnce(account) {
       }
     } catch (_e) {
       /* WebUI 未就绪 */
+    }
+  }
+
+  // 面板每 5 秒轮询：一次接口超时就显示离线，会造成「看起来总在掉线」。
+  // 最近 60 秒内刚确认过在线时保持上一次在线状态，并标记 stale 便于排查。
+  if (!result.online && account.stats && account.stats.online) {
+    const lastSeen = Number(account.stats.lastSeen) || 0;
+    if (lastSeen && Date.now() - lastSeen < 60000) {
+      result.online = true;
+      result.stale = true;
     }
   }
 
@@ -1238,7 +1265,7 @@ async function handleApi(req, res, url) {
       try {
         // 扫码窗口：用户正在弹窗里扫码，保活在此期间不重启进程，
         // 否则重启会作废刚生成的二维码、打断扫码登录。
-        account.qrSessionAt = Date.now();
+        markQrSession(account);
         const cached = qrcodeCache.get(account.id);
         // 正在重置登录态：明确告诉前端在做什么，避免弹窗一直空白。
         if (qrResetting.has(account.id)) {
@@ -1311,7 +1338,23 @@ async function handleApi(req, res, url) {
     if (parts[3] === 'qr' && method === 'POST') {
       if (MOCK) return json(res, 200, { ok: true });
       try {
-        account.qrSessionAt = Date.now(); // 扫码窗口：保活不重启进程
+        markQrSession(account); // 扫码窗口：保活不重启进程
+        // 手动「刷新二维码」会强制切回扫码阶段。先只读确认账号确实没登录，
+        // 否则一次误点就会把在线账号踢下线；状态读不到时也不冒险刷新。
+        const current = await napcat.getWebuiLoginStatus(account, 5000);
+        if (current && current.isLogin) {
+          qrRefreshFails.delete(account.id);
+          cacheQrState(account.id, {
+            isLogin: true,
+            qrcode: '',
+            info: current.info,
+            fetchedAt: Date.now(),
+          });
+          return json(res, 200, { ok: true, isLogin: true, alreadyLogin: true });
+        }
+        if (!current || !current.hasLoginFlag) {
+          return json(res, 200, { ok: false, error: '登录状态暂不可读，请稍后再试' });
+        }
         qrEmptyRounds.delete(account.id);
         const qrcode = await napcat.refreshQrcode(account);
         // 主动刷新后旧缓存作废；拿到新码就直接入缓存，下次轮询秒回。

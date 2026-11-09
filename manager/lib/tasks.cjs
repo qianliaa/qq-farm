@@ -13,6 +13,12 @@ const MAX_KEEPALIVE_RESTARTS = 3;
 const QR_SESSION_PROTECT_MS = 5 * 60 * 1000;
 /** 探测到“明确离线”后隔多久复核一次，避免瞬时报文把在线账号判成掉线。 */
 const OFFLINE_RECHECK_DELAY_MS = 12 * 1000;
+/** 接口短暂不可读时的复核间隔：比确认离线短，避免把恢复拖慢。 */
+const UNREACHABLE_RECHECK_DELAY_MS = 5 * 1000;
+/** 接口不可达至少连续这么多轮才考虑重启，且必须先做进程体检。 */
+const UNREACHABLE_MIN_FAILS = 3;
+/** 进程与端口都正常、只是接口读不到时，累计到这么多轮才允许重启。 */
+const UNREACHABLE_RESTART_FAILS = 6;
 
 const TASK_META = {
   keepalive: { name: '在线保活', desc: '保持电脑 QQ 在线，对应「电脑 QQ 在线 / 连续登录」加速项' },
@@ -65,6 +71,18 @@ function parseMessageText(event) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 多账号保活错峰：按账号 id 稳定散列出一个 0–45 秒的偏移，
+ * 避免所有账号在同一轮 tick 里同时探测、同时判定失败、同时重启。
+ */
+function keepaliveJitterMs(accountId) {
+  let hash = 0;
+  for (let i = 0; i < String(accountId).length; i += 1) {
+    hash = (hash * 31 + String(accountId).charCodeAt(i)) >>> 0;
+  }
+  return hash % 45000;
 }
 
 class TaskEngine {
@@ -196,9 +214,15 @@ class TaskEngine {
   async maybeKeepalive(account, task) {
     if (!task || !task.enabled) return;
     const intervalMs = Math.max(1, Number(task.intervalMin) || 5) * 60 * 1000;
-    const last = this.lastKeepalive.get(account.id) || 0;
-    if (Date.now() - last < intervalMs) return;
-    this.lastKeepalive.set(account.id, Date.now());
+    // lastKeepalive 存的是「下次允许探测的时间」，不是上次探测时间。
+    const next = this.lastKeepalive.get(account.id);
+    if (next === undefined) {
+      // 首次只登记错峰偏移，下一轮 tick（10 秒）再按时间触发。
+      this.lastKeepalive.set(account.id, Date.now() + keepaliveJitterMs(account.id));
+      return;
+    }
+    if (Date.now() < next) return;
+    this.lastKeepalive.set(account.id, Date.now() + intervalMs);
     await this.withLock(account, 'keepalive', () => this.runKeepalive(account, task));
   }
 
@@ -334,24 +358,26 @@ class TaskEngine {
       return { ok: false, message: '启动宽限期内，暂不判定' };
     }
 
-    // 明确离线先复核一次：NapCat 重连/读盘瞬间可能返回一次 isLogin=false，
-    // 单次采样就判掉线会造成“日志说掉线、实际在线”的误报。
-    if (probe.confirmed) {
-      this.logger.info(
-        `保活探测报告离线${probe.isOfflineFlag ? '（isOffline）' : ''}，${OFFLINE_RECHECK_DELAY_MS / 1000} 秒后复核`,
-        this.meta(account)
-      );
-      await sleep(OFFLINE_RECHECK_DELAY_MS);
-      const again = await this.probeOnline(account, this.clientFor(account));
-      if (again.online) {
-        this.logger.info('复核后已在线，本轮不判定掉线', this.meta(account));
-        probe = again;
-      } else if (again.confirmed) {
-        probe = again;
-      } else {
-        // 复核反而读不到状态：降级为未确认，不通知、不按“确认掉线”处理。
-        probe = { ...again, confirmed: false, error: again.error || new Error('复核时登录状态不可读') };
-      }
+    // 所有「没探测到在线」的情况都复核一次：NapCat 重连/读盘瞬间会返回一次
+    // isLogin=false，或 OneBot 与 WebUI 同时短暂不可读；单次采样就动作，
+    // 会把仍在线的账号自己重启掉线。
+    const recheckDelay = probe.confirmed ? OFFLINE_RECHECK_DELAY_MS : UNREACHABLE_RECHECK_DELAY_MS;
+    this.logger.info(
+      probe.confirmed
+        ? `保活探测报告离线${probe.isOfflineFlag ? '（isOffline）' : ''}，${recheckDelay / 1000} 秒后复核`
+        : `保活探测接口暂不可读，${recheckDelay / 1000} 秒后复核`,
+      this.meta(account)
+    );
+    await sleep(recheckDelay);
+    const again = await this.probeOnline(account, this.clientFor(account));
+    if (again.online) {
+      this.logger.info('复核后已在线，本轮不判定掉线', this.meta(account));
+      probe = again;
+    } else if (again.confirmed) {
+      probe = again;
+    } else {
+      // 复核仍读不到状态：降级为未确认，不通知、不当成「确认掉线」处理。
+      probe = { ...again, confirmed: false, error: again.error || new Error('复核时登录状态不可读') };
     }
 
     if (probe.online) {
@@ -373,33 +399,58 @@ class TaskEngine {
       return { ok: true, message: '复核后在线' };
     }
 
-    const reason = probe.confirmed
-      ? 'QQ 当前不在线'
+    const confirmed = Boolean(probe.confirmed);
+    const reason = confirmed
+      ? `QQ 当前不在线${probe.phase ? `（阶段 ${probe.phase}）` : ''}${probe.loginError ? `：${probe.loginError}` : ''}`
       : `OneBot 与 WebUI 均无响应${probe.error ? `：${probe.error.message}` : ''}`;
-    // 已确认离线（且复核仍离线）才标记面板与发通知；接口异常等达到阈值再标记。
-    if (probe.confirmed) {
+    const guard = napcat.ensureRestartGuard(account);
+    // 两类失败分开计数：只有「确认离线」才触发快照恢复/重启；
+    // 接口不可读说明探测链路本身有问题，急着重启只会制造一次真实掉线。
+    if (confirmed) {
+      guard.failures = Number(guard.failures || 0) + 1;
+      guard.unreachable = 0;
       this.store.recordOffline(account);
       this.fireNotify(account, 'offline');
+    } else {
+      guard.unreachable = Number(guard.unreachable || 0) + 1;
     }
-    const guard = napcat.ensureRestartGuard(account);
-    guard.failures = Number(guard.failures || 0) + 1;
     guard.updatedAt = Date.now();
-    const fails = guard.failures;
+    const fails = confirmed ? guard.failures : guard.unreachable;
+    const threshold = confirmed
+      ? Math.max(1, Number(task.failThreshold) || 2)
+      : Math.max(UNREACHABLE_MIN_FAILS, Number(task.failThreshold) || 2);
     napcat.noteRecovery(account, {
       phase: 'keepalive',
-      webuiIsLogin: probe.source === 'webui' ? false : null,
-      decision: probe.confirmed ? 'offline-confirmed' : 'probe-unreachable',
+      webuiIsLogin: confirmed ? false : null,
+      decision: confirmed ? 'offline-confirmed' : 'probe-unreachable',
       probeSource: probe.source,
+      webuiPhase: probe.phase || '',
+      loginError: probe.loginError || '',
       error: reason,
     });
     this.store.save();
     if (fails === 1) {
       this.logger.warn(`保活探测失败：${reason}`, this.meta(account));
     }
-    if (fails < Math.max(1, Number(task.failThreshold) || 2) || !task.autoRestart) {
+    if (fails < threshold || !task.autoRestart) {
       return { ok: false, message: reason };
     }
+    if (!confirmed) {
+      // 接口不可读时先体检：进程还活着、WebUI 端口也通，说明只是接口暂时
+      // 无响应；进程已退出则交给后台巡检拉起，避免两条路径重复重启。
+      const health = await napcat.statusAccount(account);
+      if (!health.running) {
+        this.logger.info('进程已退出，交给后台巡检拉起，避免重复重启', this.meta(account));
+        return { ok: false, message: '进程未运行，等待自动拉起' };
+      }
+      if (health.webuiReady && guard.unreachable < UNREACHABLE_RESTART_FAILS) {
+        this.logger.info('进程与 WebUI 端口正常，仅接口暂不可读，暂不重启', this.meta(account));
+        return { ok: false, message: '接口暂时不可读，进程正常，暂不重启' };
+      }
+      this.logger.warn('接口长期不可读，准备重启 NapCat', this.meta(account));
+    }
     guard.failures = 0;
+    guard.unreachable = 0;
     guard.updatedAt = Date.now();
     this.store.recordOffline(account);
 

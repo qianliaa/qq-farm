@@ -1063,6 +1063,17 @@ async function refreshQr() {
   if (!state.qr.accountId) return;
   try {
     const data = await api(`/api/accounts/${state.qr.accountId}/qr`, { method: 'POST', timeout: 50000 });
+    if (data && data.error) {
+      toast(data.error, 'error', 2600);
+      return;
+    }
+    if (data && data.alreadyLogin) {
+      toast('账号已在线，无需刷新二维码', 'success', 2200);
+      state.qr.done = true;
+      stopQrPolling();
+      closeModal('loginModal');
+      return;
+    }
     state.qr.current = '';
     if (data && data.resetting) {
       toast('旧登录已失效，正在重置登录状态并重新出码', 'info', 2600);

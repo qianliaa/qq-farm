@@ -83,21 +83,37 @@ function withAccountLock(accountOrId, task) {
 
 const RESTART_GUARD_DEFAULTS = Object.freeze({
   suspended: false,
+  suspendedAt: 0,
   failures: 0,
+  unreachable: 0,
   attempts: 0,
   nextRetryAt: 0,
   lastAttemptAt: 0,
   updatedAt: 0,
 });
 
+/** 自动重启被暂停后冷却这么久自动解除一次，避免账号永久停摆等人处理。 */
+const SUSPEND_COOLDOWN_MS = 30 * 60 * 1000;
+/** supervise(8s) 与保活(30s) 可能在同一轮故障里各记一次重启，短时间只算一次。 */
+const RESTART_ATTEMPT_DEDUP_MS = 15 * 1000;
+
 function ensureRestartGuard(account) {
-  account.autoRestartGuard = { ...RESTART_GUARD_DEFAULTS, ...(account.autoRestartGuard || {}) };
+  // 原地补全，不重新分配对象：tasks/server 里多处持有 guard 引用，
+  // 每次换一个新对象会让后续写入落在旧副本上、状态悄悄丢失。
+  if (!account.autoRestartGuard || typeof account.autoRestartGuard !== 'object') {
+    account.autoRestartGuard = { ...RESTART_GUARD_DEFAULTS };
+  } else {
+    for (const [key, value] of Object.entries(RESTART_GUARD_DEFAULTS)) {
+      if (account.autoRestartGuard[key] === undefined) account.autoRestartGuard[key] = value;
+    }
+  }
   return account.autoRestartGuard;
 }
 
 function resetRestartGuard(account) {
-  account.autoRestartGuard = { ...RESTART_GUARD_DEFAULTS, updatedAt: Date.now() };
-  return account.autoRestartGuard;
+  const guard = ensureRestartGuard(account);
+  Object.assign(guard, RESTART_GUARD_DEFAULTS, { updatedAt: Date.now() });
+  return guard;
 }
 
 function restartBackoffMs(attempts) {
@@ -107,10 +123,15 @@ function restartBackoffMs(attempts) {
 
 function noteRestartAttempt(account) {
   const guard = ensureRestartGuard(account);
-  guard.attempts = Number(guard.attempts || 0) + 1;
-  guard.lastAttemptAt = Date.now();
-  guard.nextRetryAt = Date.now() + restartBackoffMs(guard.attempts);
-  guard.updatedAt = Date.now();
+  const now = Date.now();
+  // 后台巡检与保活是两条独立循环，同一轮故障里可能各记一次；
+  // 15 秒内的重复调用只更新退避时间，不再把 attempts 翻倍。
+  if (now - Number(guard.lastAttemptAt || 0) >= RESTART_ATTEMPT_DEDUP_MS) {
+    guard.attempts = Number(guard.attempts || 0) + 1;
+  }
+  guard.lastAttemptAt = now;
+  guard.nextRetryAt = now + restartBackoffMs(guard.attempts);
+  guard.updatedAt = now;
   return guard;
 }
 
@@ -123,7 +144,21 @@ function noteRestartFailure(account) {
 
 function canAutoRestart(account, now = Date.now()) {
   const guard = ensureRestartGuard(account);
-  return !guard.suspended && now >= Number(guard.nextRetryAt || 0);
+  if (guard.suspended) {
+    // 用独立的 suspendedAt 计时：失败计数会不断刷新 updatedAt，
+    // 拿它当暂停起点会导致冷却永远走不完。
+    if (!Number(guard.suspendedAt || 0)) guard.suspendedAt = Number(guard.updatedAt) || now;
+    if (now - Number(guard.suspendedAt) < SUSPEND_COOLDOWN_MS) return false;
+    guard.suspended = false;
+    guard.suspendedAt = 0;
+    guard.attempts = 0;
+    guard.failures = 0;
+    guard.unreachable = 0;
+    guard.nextRetryAt = 0;
+    guard.updatedAt = now;
+    return true;
+  }
+  return now >= Number(guard.nextRetryAt || 0);
 }
 
 function appendAccountLog(account, message) {
@@ -498,11 +533,13 @@ function ensureAccountOnebotConfig(account, uin) {
   const desired = buildOnebotConfig(account);
   const existed = fs.existsSync(file);
   let config;
+  let parseFailed = false;
   if (existed) {
     try {
       config = JSON.parse(fs.readFileSync(file, 'utf8'));
     } catch (_e) {
       config = desired;
+      parseFailed = true;
     }
   } else {
     config = desired;
@@ -513,12 +550,13 @@ function ensureAccountOnebotConfig(account, uin) {
 
   const hasHttp = config.network.httpServers.some((s) => s && s.name === 'qqnas-http');
   const hasHook = config.network.httpClients.some((c) => c && c.name === 'qqnas-manager');
+  // 配置已完整时绝不回写：NapCat 会监听账号级配置文件，
+  // 管理端每次重启都原子替换一次会触发热重载、把在线的 OneBot 连接打断。
+  if (existed && !parseFailed && hasHttp && hasHook) return false;
   if (!hasHttp) config.network.httpServers.push(desired.network.httpServers[0]);
   if (!hasHook) config.network.httpClients.push(desired.network.httpClients[0]);
-
-  const before = JSON.stringify(config);
   writeJsonFile(file, config);
-  return !existed || before !== JSON.stringify(config);
+  return true;
 }
 
 /* ------------------------------- 进程管理 ------------------------------- */
@@ -1111,6 +1149,8 @@ const RECOVERY_DEFAULTS = {
   decision: '',
   probeSource: '',
   webuiOfflineHint: false,
+  webuiPhase: '',
+  loginError: '',
   restoreAttempted: false,
   restoreResult: '',
   restoreAction: '',
@@ -1147,6 +1187,8 @@ function noteRecovery(account, patch = {}) {
         decision: record.decision || '',
         probeSource: record.probeSource || '',
         webuiOfflineHint: Boolean(record.webuiOfflineHint),
+        webuiPhase: record.webuiPhase || '',
+        loginError: record.loginError || '',
         restoredAt: iso(record.restoredAt),
         restoreAttempted: record.restoreAttempted,
         restoreAction: record.restoreAction,
@@ -1705,12 +1747,12 @@ async function stopAccountUnlocked(account, { preserveDesired = false, snapshotG
     }
   }
 
-  // 退出事件可能比 waitGone 稍晚送达：延后清理“主动停止”标记，
-  // 否则正常停止会被记成异常退出并累加失败计数。
+  // 退出事件可能比 waitGone 稍晚送达；停号后还要做完整登录快照，
+  // 标记保留 60 秒，避免晚到的正常退出被记成异常退出、抬升失败计数。
   if (exitMark) {
     const timer = setTimeout(() => {
       if (expectedExits.get(account.id) === exitMark) expectedExits.delete(account.id);
-    }, 15000);
+    }, 60000);
     if (timer.unref) timer.unref();
   } else {
     expectedExits.delete(account.id);
@@ -1731,7 +1773,9 @@ async function restartAccount(account) {
 }
 
 async function restartAccountUnlocked(account) {
-  await stopAccountUnlocked(account);
+  // 重启期间保留 running 意图：否则后台巡检/面板会在 stop 与 start 之间
+  // 看到 desiredState=stopped，把一次普通重启误认为用户主动停号。
+  await stopAccountUnlocked(account, { preserveDesired: true });
   await sleep(800);
   return startAccountUnlocked(account);
 }
@@ -1739,7 +1783,7 @@ async function restartAccountUnlocked(account) {
 /** 重建运行环境但保留 home 下的登录数据，整段在同一把账号锁内完成。 */
 async function recreateAccount(account) {
   return withAccountLock(account, async () => {
-    await stopAccountUnlocked(account);
+    await stopAccountUnlocked(account, { preserveDesired: true });
     fs.rmSync(accountDirs(account).napcat, { recursive: true, force: true });
     return startAccountUnlocked(account);
   });
@@ -1806,11 +1850,22 @@ function webuiRequest(baseUrl, method, pathName, body, credential, timeout = 800
         res.on('data', (c) => chunks.push(c));
         res.on('end', () => {
           const text = Buffer.concat(chunks).toString('utf8');
+          let parsed;
           try {
-            resolve(JSON.parse(text));
+            parsed = text ? JSON.parse(text) : {};
           } catch (_e) {
-            reject(new Error(`WebUI 返回非 JSON：${text.slice(0, 120)}`));
+            const err = new Error(`WebUI 返回非 JSON（HTTP ${res.statusCode}）：${text.slice(0, 120)}`);
+            err.statusCode = res.statusCode;
+            reject(err);
+            return;
           }
+          if (res.statusCode >= 400) {
+            const err = new Error(`WebUI 未授权或请求失败（HTTP ${res.statusCode}）：${String(parsed.message || '').slice(0, 120)}`);
+            err.statusCode = res.statusCode;
+            reject(err);
+            return;
+          }
+          resolve(parsed);
         });
       }
     );
@@ -1822,6 +1877,8 @@ function webuiRequest(baseUrl, method, pathName, body, credential, timeout = 800
 }
 
 const credentialCache = new Map();
+/** 保活、面板状态、二维码轮询会同时打 WebUI；登录请求单飞，避免撞上 loginRate 限流。 */
+const webuiLoginInflight = new Map();
 
 function webuiBase(account) {
   if (!account.webuiPort) throw new Error('账号 WebUI 端口尚未分配');
@@ -1829,30 +1886,50 @@ function webuiBase(account) {
 }
 
 async function webuiLogin(account) {
-  const baseUrl = webuiBase(account);
   const cached = credentialCache.get(account.id);
   if (cached && Date.now() < cached.expires) return cached.credential;
+  const pending = webuiLoginInflight.get(account.id);
+  if (pending) return pending;
 
-  const hash = sha256(`${account.webuiToken}.napcat`);
-  const result = await webuiRequest(baseUrl, 'POST', '/api/auth/login', { hash });
-  if (!result || result.code !== 0 || !result.data || !result.data.Credential) {
-    throw new Error((result && result.message) || 'WebUI 登录失败');
+  const baseUrl = webuiBase(account);
+  const task = (async () => {
+    const hash = sha256(`${account.webuiToken}.napcat`);
+    const result = await webuiRequest(baseUrl, 'POST', '/api/auth/login', { hash });
+    if (!result || result.code !== 0 || !result.data || !result.data.Credential) {
+      throw new Error((result && result.message) || 'WebUI 登录失败');
+    }
+    const credential = result.data.Credential;
+    credentialCache.set(account.id, { credential, expires: Date.now() + 50 * 60 * 1000 });
+    return credential;
+  })();
+  webuiLoginInflight.set(account.id, task);
+  try {
+    return await task;
+  } finally {
+    if (webuiLoginInflight.get(account.id) === task) webuiLoginInflight.delete(account.id);
   }
-  const credential = result.data.Credential;
-  credentialCache.set(account.id, { credential, expires: Date.now() + 50 * 60 * 1000 });
-  return credential;
 }
 
 async function webuiPost(account, pathName, body = {}, timeout = 8000) {
   const baseUrl = webuiBase(account);
   let credential = await webuiLogin(account);
-  let result = await webuiRequest(baseUrl, 'POST', pathName, body, credential, timeout);
-  if (result && result.code !== 0 && /Unauthorized|token/i.test(result.message || '')) {
+  try {
+    const result = await webuiRequest(baseUrl, 'POST', pathName, body, credential, timeout);
+    // NapCat 有时返回 200 + code!=0 表示凭据失效，也要走重登。
+    if (result && result.code !== 0 && /Unauthorized|token|credential/i.test(result.message || '')) {
+      throw Object.assign(new Error('WebUI 凭据失效'), { credentialExpired: true });
+    }
+    return result;
+  } catch (err) {
+    // NapCat 重启后旧 Credential 会失效，且常以 HTTP 401/403（非 JSON）返回。
+    // 旧实现只认 JSON 里的 Unauthorized，探测会连续失败到触发误重启。
+    const expired =
+      err.credentialExpired === true || err.statusCode === 401 || err.statusCode === 403;
+    if (!expired) throw err;
     credentialCache.delete(account.id);
     credential = await webuiLogin(account);
-    result = await webuiRequest(baseUrl, 'POST', pathName, body, credential, timeout);
+    return webuiRequest(baseUrl, 'POST', pathName, body, credential, timeout);
   }
-  return result;
 }
 
 /** 二维码生成是阻塞式的：NapCat 要等 QQ 出图，启动初期可达几十秒，8 秒默认值等不到。 */
@@ -1917,6 +1994,27 @@ async function getWebuiLoginStatus(account, timeout = 5000) {
   };
 }
 
+/**
+ * 出码前确认「确实没登录」。
+ *
+ * GetQQLoginQrcode / RefreshQRcode 会把 QQ 内核从快速登录流程切到扫码流程，
+ * 在账号只是瞬时抖动或正在重连时调用，等于自己把在线账号踢下线。
+ * 2.0.23 已把保活和面板状态改为只读，但登录弹窗仍会每 3 秒走一次取码路径，
+ * 所以这里要求连续三次只读探测都明确返回 isLogin=false 才允许出码。
+ */
+async function confirmLoggedOut(account) {
+  // 只有接口读不通才阻止出码。老版本 NapCat 的 CheckLoginStatus 可能不带
+  // isLogin 字段，字段缺失时按「未登录候选」处理，否则这些版本永远出不了码。
+  const second = await getWebuiLoginStateQuiet(account, 4000);
+  if (!second) return { loggedOut: false, recovered: null };
+  if (second.isLogin) return { loggedOut: false, recovered: second };
+  await sleep(1500);
+  const third = await getWebuiLoginStateQuiet(account, 4000);
+  if (!third) return { loggedOut: false, recovered: null };
+  if (third.isLogin) return { loggedOut: false, recovered: third };
+  return { loggedOut: true, recovered: null };
+}
+
 async function getWebuiLoginState(account) {
   const status = await webuiPost(account, '/api/QQLogin/CheckLoginStatus');
   if (!status || status.code !== 0) {
@@ -1925,10 +2023,35 @@ async function getWebuiLoginState(account) {
   const data = status.data || {};
   let qrcode = extractQrcode(data);
   if (!data.isLogin && !qrcode) {
+    const confirmation = await confirmLoggedOut(account);
+    if (confirmation.recovered) {
+      // 第一次 CheckLoginStatus 是滞后的 false：按已登录返回，让弹窗直接关闭。
+      return {
+        isLogin: true,
+        isOffline: false,
+        phase: confirmation.recovered.phase || '',
+        error: '',
+        qrcode: '',
+        info: confirmation.recovered.info || null,
+        transient: false,
+      };
+    }
+    if (!confirmation.loggedOut) {
+      // 状态不可读或内核正在重连：本轮不出码、不刷新，等下一轮轮询。
+      return {
+        isLogin: false,
+        isOffline: Boolean(data.isOffline),
+        phase: data.loginPhase || '',
+        error: data.loginError || '',
+        qrcode: '',
+        info: null,
+        transient: true,
+      };
+    }
     const qr = await webuiPost(account, '/api/QQLogin/GetQQLoginQrcode', {}, QRCODE_FETCH_TIMEOUT);
     if (qr && qr.code === 0) qrcode = extractQrcode(qr.data);
     // 被踢下线的账号内核常卡在旧票据快速重登循环里，不进扫码阶段，
-    // 被动取码一直为空；主动 Refresh 强制切回扫码阶段出码。
+    // 被动取码一直为空；确认确实没登录后，主动 Refresh 强制切回扫码阶段出码。
     if (!qrcode) {
       const refreshed = await webuiPost(account, '/api/QQLogin/RefreshQRcode', {}, QRCODE_FETCH_TIMEOUT);
       if (refreshed && refreshed.code === 0) qrcode = extractQrcode(refreshed.data);
@@ -1950,6 +2073,7 @@ async function getWebuiLoginState(account) {
     error: data.loginError || '',
     qrcode,
     info,
+    transient: false,
   };
 }
 
