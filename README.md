@@ -36,9 +36,11 @@
 
 ```bash
 mkdir -p qq-farm/data qq-farm/qq && cd qq-farm
-curl -O https://raw.githubusercontent.com/qianliaa/qq-farm/main/docker-compose.yml
+# 从 Releases 下载 docker-compose.yml 放到当前目录，然后：
 docker compose up -d
 ```
+
+> `docker-compose.yml` 自 v1.0.15 起随 [Releases](https://github.com/qianliaa/qq-farm/releases) 附带，也可直接取仓库根目录那份。
 
 1. 把官方 Linux QQ 的 deb 放进 `qq/` 后执行 `docker compose restart`（也可在面板「环境准备 → 方式 A」填下载直链）；
 2. 打开 `http://<NAS>:8788/`，首次设置管理密码；

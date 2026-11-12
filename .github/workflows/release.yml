@@ -27,7 +27,9 @@ jobs:
       - name: 上传到 Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.fpk
+          files: |
+            dist/*.fpk
+            docker-compose.yml
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
