@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "native/**"
+      - "tools/**"
+      - "docker/**"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: 校验与回归
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 源码校验
+        run: python tools/build-native-check.py
+
+      - name: 面板回归
+        run: python tools/test_native_panel.py
+
+      - name: 诊断 / 更新检查
+        run: python tools/test_native_diag.py
+
+      - name: 运行时与部署方式
+        run: python tools/test_native_runtime.py

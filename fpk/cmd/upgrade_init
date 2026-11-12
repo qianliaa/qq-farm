@@ -1,3 +1,0 @@
-#!/bin/bash
-### 升级前：账号配置与登录数据都在 Docker 命名卷里，不受 target 目录替换影响。
-exit 0

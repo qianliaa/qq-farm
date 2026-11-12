@@ -2,7 +2,7 @@
 
 **这是解决「安装时提示没有 Docker 权限」的版本。**
 
-`dist/qqfarm-native-1.0.0.fpk` 是一个**可以直接安装**的原生 FPK（x86 / ARM 通用）：
+`qqfarm-native-<版本>.fpk` 是一个**可以直接安装**的原生 FPK（x86 / ARM 通用）：
 manifest 里没有 `docker-project`、没有 `install_dep_apps`，应用中心安装时
 **不会检查 Docker 服务、不会检查 Docker 权限、不会去拉任何依赖应用**。
 面板就是一个普通 Python 进程，每个 QQ 账号是一组原生进程。
@@ -11,21 +11,25 @@ manifest 里没有 `docker-project`、没有 `install_dep_apps`，应用中心�
 
 ---
 
-## 一、和 Docker 版的区别
+## 一、和 Docker 镜像的区别
 
-| | Docker 版 | 原生版（装这个） |
+两种方式跑的是**同一套面板代码**（`native/app/panel`），区别只在运行环境和图形栈来源。
+
+| | Docker 镜像 | 原生 FPK（推荐） |
 | --- | --- | --- |
-| 应用类型 | `docker-project` FPK | 原生 FPK（`config/resource` 只有 `data-share`） |
-| 安装门槛 | **需要 Docker 服务与权限**（你可能就是卡在这里） | **零依赖，直接装** |
-| 运行时 | `python:3.11-alpine` 容器 | 优先商店 Python 3.12 运行时，没装则用系统 `python3` |
-| 账号隔离 | 每号一个容器 + Docker 卷 | 每号独立 DISPLAY / HOME / 端口 + 独立目录 |
-| 端口 | 8787 + 每号一个 5801+ | **只有 8788**，所有桌面走 `/desktop/<id>/` |
-| 图形栈 | QQ 容器镜像自带 | 装好后由面板「环境准备」一键补齐到应用目录 |
-| 成品包 | `dist/qqfarm-1.0.0.fpk` | `dist/qqfarm-native-1.0.0.fpk`（可直接装） |
-| 是否需要 root / SSH | 否 | **否** |
+| 安装方式 | `docker compose up -d` | 应用中心手动安装 `.fpk` |
+| 依赖 | 宿主机 Docker | 商店「Python 3.12 运行时」（安装时自动部署） |
+| 端口 | 8788 | 8788 |
+| 图形栈 | 镜像内置 Xvfb / x11vnc / noVNC（不含 QQ 本体） | 面板「环境准备」一键补齐到应用目录 |
+| QQ 客户端 | 需自行放 deb 到 `./qq` | 「环境准备」下载官方 deb 自动解包 |
+| 数据目录 | `./data`（账号与登录态）、`./qq`（deb） | 应用共享目录 `qqfarm/` |
+| 账号隔离 | 每号独立进程组 + 独立数据目录 | 同左 |
+| 是否需要 root / SSH | 否 | 否 |
 
 **共同点**：官方 Linux QQ 客户端、浏览器扫码登录、常驻在线、独立登录数据、中文管理面板、
 应用中心启停联动、卸载默认保留数据。
+
+> 早期还有一个把 Docker Compose 打成 FPK 的「Docker 版 FPK」，已归档不再维护，源码可从 git 历史取回。
 
 ---
 
@@ -59,7 +63,7 @@ libnss3 / libgbm1 / libasound2 / libatk-* / libX* ...   QQ 与图形栈的动态
 
 ## 三、安装步骤
 
-1. 飞牛桌面 → **应用中心 → 手动安装** → 选择 `dist/qqfarm-native-1.0.0.fpk`（包内只有 Python 代码，x86 / ARM 通用）。
+1. 飞牛桌面 → **应用中心 → 手动安装** → 选择 `qqfarm-native-<版本>.fpk`（包内只有 Python 代码，x86 / ARM 通用）。
    **这一步不会再出现 Docker 权限提示。**
 2. 安装向导：确认说明 → 选虚拟桌面分辨率（默认 1280×800）→ 勾选风险确认。
 3. 桌面点开「QQ 多开挂机（原生）」，首次设置管理密码（≥8 位）。
@@ -126,8 +130,8 @@ cmd/main (fnOS 生命周期)
 
 ```bash
 cd /vol1/docker/qqfarm
-bash tools/build-native.sh --qq-deb ~/QQ_3.2.15_241210_amd64_01.deb
-# 产物 dist/qqfarm-native-1.0.0-x86.fpk / -arm.fpk（含全部二进制，装完即就绪）
+bash tools/build-native.sh --bundle --qq-deb ~/QQ_3.2.15_241210_amd64_01.deb
+# 产物 dist/qqfarm-native-<版本>-<架构>.fpk（含全部二进制，装完即就绪）
 ```
 
 脚本会自动下载 fnpack Linux 版、noVNC、图形栈 deb，解包进 `native/app/runtime/`，
@@ -135,9 +139,11 @@ bash tools/build-native.sh --qq-deb ~/QQ_3.2.15_241210_amd64_01.deb
 
 | 参数 | 说明 |
 | --- | --- |
+| `--online` | 在线补齐包：纯代码，装完由面板一键补齐（**发布用这个**） |
+| `--bundle` | 默认。下载并捆绑官方 QQ + Xvfb/x11vnc + noVNC + 依赖库 |
+| `--slim` | 精简包：只打面板代码，运行时用系统已装的 qq / Xvfb / x11vnc |
 | `--qq-deb <路径>` | 本地官方 QQ deb（推荐） |
 | `--qq-url <URL>` | deb 下载直链 |
-| `--slim` | 只打面板代码，运行时用系统命令 |
 | `--arch x86\|arm` | 覆盖架构检测 |
 | `--extra-debs "a b"` | 追加要解包的 Debian 包 |
 | `--fnpack <路径>` | 指定已有 fnpack |
@@ -147,25 +153,7 @@ bash tools/build-native.sh --qq-deb ~/QQ_3.2.15_241210_amd64_01.deb
 
 ## 七、常见问题
 
-**安装时仍提示 Docker 相关错误**
-你装的多半是桌面上的 `qqfarm-1.0.0.fpk`（Docker 版）。请改选
-`qqfarm-native-1.0.0.fpk`；原生版包名带 `native`，应用名是「QQ 多开挂机（原生版）」。
-
-**右上角显示「图形栈未就绪」**
-点「立即准备」看进度日志。常见原因：QQ deb 直链失效（改用方式 B 上传）、GitHub 打不开
-（在「noVNC 备用地址」填镜像）、NAS 的 apt 源未初始化（日志会给出手动放置路径）。
-
-**QQ 进程起来了但网页桌面连不上**
-看账号日志，多半是 VNC 服务没起来（端口冲突 / 缺库）。可在账号「编辑」里换一个内部 VNC 端口。
-
-**QQ 白屏 / 中文方块**
-调小虚拟桌面分辨率、确认 `app/runtime/fonts/` 有中文字体；单账号内存建议 ≥1GB。
-
-**8788 被占用**
-同步改 `native/manifest` 的 `service_port` 与 `native/app/ui/config` 的 `port` 后重新打包。
-
-**两版能同时装吗**
-可以，appname 与端口都不同（`qqfarm` / 8787、`qqfarm-native` / 8788），但会各跑一份 QQ，注意内存。
+见 [docs/faq.md](faq.md)。
 
 ---
 
@@ -177,7 +165,6 @@ bash tools/build-native.sh --qq-deb ~/QQ_3.2.15_241210_amd64_01.deb
 - 二进制不能跨架构，离线全量包要分 x86 / arm；默认的在线补齐包本身是纯代码，架构无关。
 - 在 NAS 上长期挂机可能触发 QQ 风控或要求重新验证，重要账号请谨慎。
 - 面板有管理密码，网页桌面也需登录；仍建议只在可信局域网使用，不要把 8788 暴露到公网。
-- **未在真机 fnOS 上实装验证**，建议先只挂 1 个号试跑。
 
 ---
 
@@ -196,7 +183,9 @@ native/                          原生 FPK 源码
 │   └── static/                 管理界面（含环境准备弹窗）
 ├── cmd/                        生命周期（PID 文件，启停联动）
 └── wizard/                     安装 / 配置 / 卸载向导
-tools/build-native.sh           可选：离线预置全量包
-tools/build-native-check.py      源码校验
-tools/test_native_panel.py       端到端自测（mock 进程与下载，56 项断言）
+tools/build-native.sh           构建脚本（--online / --bundle / --slim）
+tools/build-native-check.py     源码校验
+tools/test_native_panel.py      面板端到端自测（mock 进程与下载）
+tools/test_native_diag.py       崩溃诊断 / 色深 / 更新检查
+tools/test_native_runtime.py    运行时与部署方式
 ```

@@ -3,6 +3,9 @@ __pycache__/
 *.pyc
 dist/
 qqfarm-native.fpk
+tools/.native-build/
+.pytest_cache/
+.venv/
 
 # Docker 本地数据（账号 / 登录态 / QQ deb）
 data/

@@ -1,4 +1,0 @@
-#!/bin/bash
-### 配置变更后：重启面板容器，让新的端口范围生效。
-docker restart qqfarm-panel >/dev/null 2>&1 || true
-exit 0

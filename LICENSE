@@ -21,8 +21,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 Third-party notice:
-This application orchestrates the community Docker image
-"libzonda/linux-qq-release", which redistributes the official Tencent QQ
-client for Linux. All rights to the QQ software and trademarks belong to
-Tencent. This project is not affiliated with or endorsed by Tencent or
-Feiniu / fnOS.
+This application orchestrates the official Tencent QQ client for Linux. All
+rights to the QQ software and trademarks belong to Tencent. This project is
+not affiliated with or endorsed by Tencent or Feiniu / fnOS.

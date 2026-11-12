@@ -1,9 +1,0 @@
-#!/bin/bash
-# 升级后：确认新包里的面板代码已经就位，然后重启面板容器以加载新版本。
-LOGFILE="${TRIM_TEMP_LOGFILE:-/tmp/qqfarm-error.log}"
-if [ ! -f "${TRIM_APPDEST}/docker/panel/server.py" ]; then
-    echo "升级后未找到面板代码，请重新安装应用。" > "$LOGFILE"
-    exit 1
-fi
-docker restart qqfarm-panel >/dev/null 2>&1 || true
-exit 0

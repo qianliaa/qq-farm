@@ -2,10 +2,10 @@
 """生成飞牛应用图标（纯标准库，不依赖 Pillow / cairosvg）。
 
 输出：
-  fpk/ICON.PNG                    64x64
-  fpk/ICON_256.PNG                256x256
-  fpk/app/ui/images/icon_64.png   64x64
-  fpk/app/ui/images/icon_256.png  256x256
+  native/ICON.PNG                    64x64
+  native/ICON_256.PNG                256x256
+  native/app/ui/images/icon_64.png   64x64
+  native/app/ui/images/icon_256.png  256x256
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import zlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-FPK = ROOT / "fpk"
+NATIVE = ROOT / "native"
 S = 512  # 超采样画布，最后降采样得到 256 / 64
 
 
@@ -158,10 +158,10 @@ def write_png(path: Path, size: int, pixels: bytes):
 def main():
     canvas = render()
     outputs = [
-        (FPK / "ICON.PNG", 64, 8),
-        (FPK / "ICON_256.PNG", 256, 2),
-        (FPK / "app/ui/images/icon_64.png", 64, 8),
-        (FPK / "app/ui/images/icon_256.png", 256, 2),
+        (NATIVE / "ICON.PNG", 64, 8),
+        (NATIVE / "ICON_256.PNG", 256, 2),
+        (NATIVE / "app/ui/images/icon_64.png", 64, 8),
+        (NATIVE / "app/ui/images/icon_256.png", 256, 2),
     ]
     for path, size, factor in outputs:
         write_png(path, size, canvas.downsample(factor))
