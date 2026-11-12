@@ -1,7 +1,0 @@
-#!/bin/bash
-set -u
-
-# 升级前由应用中心停止旧版本；这里只做目录准备，避免引用旧版本可能不存在的脚本。
-mkdir -p "${TRIM_PKGVAR}/accounts" "${TRIM_PKGVAR}/runtime" "${TRIM_PKGVAR}/logs" 2>/dev/null || true
-
-exit 0

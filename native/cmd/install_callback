@@ -1,0 +1,21 @@
+#!/bin/bash
+### 安装完成回调：写一份自检报告到应用数据目录，不阻断安装。
+REPORT="${TRIM_PKGVAR:-/tmp}/qqfarm-native-install-check.txt"
+RUNTIME="${TRIM_APPDEST}/runtime"
+[ -d "$RUNTIME" ] || RUNTIME="${TRIM_APPDEST}/app/runtime"
+{
+    echo "QQ挂机仓 安装自检 $(date '+%F %T')"
+    echo "Python: ${QQFARM_PYTHON:-<由 cmd/main 探测>}"
+    echo "运行时: ${RUNTIME}"
+    for f in sys/usr/bin/Xvfb sys/usr/bin/x11vnc QQ/opt/QQ/qq novnc/core/rfb.js; do
+        if [ -e "${RUNTIME}/${f}" ]; then
+            echo "  [已捆绑] ${f}"
+        else
+            echo "  [缺失]   ${f}"
+        fi
+    done
+} > "$REPORT" 2>/dev/null || true
+if [ ! -e "${RUNTIME}/novnc/core/rfb.js" ]; then
+    echo "提示：未检测到捆绑的 noVNC 页面。若使用精简包，请按 README 在 SSH 中补齐图形栈。" >> "$REPORT" 2>/dev/null || true
+fi
+exit 0

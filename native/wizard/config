@@ -1,0 +1,29 @@
+[
+  {
+    "stepTitle": "显示与启动",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "分辨率与自动启动也可以直接在管理面板「设置」里修改，改分辨率后重启对应账号进程组生效。"
+      },
+      {
+        "type": "select",
+        "field": "wizard_resolution",
+        "label": "虚拟桌面分辨率",
+        "initValue": "1024x768",
+        "options": [
+          { "label": "1024 × 768（推荐，省资源）", "value": "1024x768" },
+          { "label": "1280 × 800", "value": "1280x800" },
+          { "label": "1440 × 900", "value": "1440x900" },
+          { "label": "1920 × 1080", "value": "1920x1080" }
+        ]
+      },
+      {
+        "type": "switch",
+        "field": "wizard_autostart",
+        "label": "应用启动时自动拉起上次运行中的 QQ 账号",
+        "initValue": "true"
+      }
+    ]
+  }
+]

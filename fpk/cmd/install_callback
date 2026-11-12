@@ -1,0 +1,25 @@
+#!/bin/bash
+### 安装完成回调：做一次非阻塞自检，结果写入应用数据目录，不阻断安装。
+### 面板容器首次启动需要拉 python 基础镜像，这里只做提示，不判定成败。
+REPORT="${TRIM_PKGVAR:-/tmp}/qqfarm-install-check.txt"
+
+{
+    echo "QQ 多开挂机 安装自检 $(date '+%F %T')"
+    echo "TRIM_APPDEST=${TRIM_APPDEST:-<未注入>}"
+    echo "compose 代码挂载: ${TRIM_APPDEST}/docker/panel:/app:ro"
+} > "$REPORT" 2>/dev/null || true
+
+for i in 1 2 3; do
+    if docker exec qqfarm-panel test -f /app/server.py >/dev/null 2>&1; then
+        echo "面板代码挂载正常" >> "$REPORT" 2>/dev/null || true
+        break
+    fi
+    sleep 3
+done
+
+if ! docker exec qqfarm-panel test -f /app/server.py >/dev/null 2>&1; then
+    echo "提示：容器还没起来或读不到 /app/server.py。" >> "$REPORT" 2>/dev/null || true
+    echo "若 fnOS 未注入 TRIM_APPDEST，请把 compose 里该行改为： - ./panel:/app:ro" >> "$REPORT" 2>/dev/null || true
+fi
+
+exit 0

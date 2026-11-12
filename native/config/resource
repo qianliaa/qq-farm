@@ -1,0 +1,13 @@
+{
+  "data-share": {
+    "shares": [
+      {
+        "name": "qqfarm"
+      }
+    ]
+  },
+  "port-config": {
+    "protocol-file": "qqfarm-native.sc"
+  },
+  "systemd-unit": {}
+}

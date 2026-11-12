@@ -1,0 +1,8 @@
+#!/bin/bash
+### 配置变更后：重启面板让新的分辨率 / 自动启动设置生效。
+MYDIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
+if [ -x "$MYDIR/main" ]; then
+    "$MYDIR/main" stop >/dev/null 2>&1 || true
+    "$MYDIR/main" start >/dev/null 2>&1 || true
+fi
+exit 0

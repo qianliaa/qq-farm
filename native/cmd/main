@@ -1,0 +1,200 @@
+#!/bin/bash
+# QQ 多开挂机（原生版）· 生命周期脚本
+# 由飞牛 appcenter 调用：cmd/main start|stop|status|restart
+#
+# 飞牛注入的环境变量（常见）：
+#   TRIM_APPNAME / TRIM_APPDEST / TRIM_PKGVAR / TRIM_PKGETC / TRIM_PKGTMP
+#   TRIM_USERNAME / TRIM_GROUPNAME / TRIM_TEMP_LOGFILE
+#   TRIM_DATA_SHARE_PATHS / wizard_resolution / wizard_autostart
+#
+# 模型：type:url + TCP 端口（经典模型，对齐已验证可用的 auto-power 应用）
+#   1) 后端只监听 TCP 端口（默认 8788），不使用 Unix Socket。
+#   2) 飞牛桌面把应用窗口经端口转发到 http://<nas>:8788/ 。
+#   3) 用 nohup 拉起，进程随 start 返回后独立存活；stop 时按 PID 终止。
+#   4) Python 发现：优先商店 python312，再回退绝对路径 /usr/bin/python3 等。
+#   5) 就绪判定：轮询 TCP 端口可连接即成功——绝不再等待/依赖 socket，
+#      也绝不因为在跑的后端没建 socket 就把它杀掉（1.0.5 的致命 bug）。
+#   6) 启动失败时把原因写进 TRIM_TEMP_LOGFILE（应用中心可见）并返回 1。
+#
+# 注意：不使用 set -e，单条命令失败应记录后继续，避免 appcenter panic。
+
+APPNAME="${TRIM_APPNAME:-qqfarm-native}"
+APPDEST="${TRIM_APPDEST:-/var/apps/${APPNAME}/target}"
+PKGVAR="${TRIM_PKGVAR:-/var/apps/${APPNAME}/var}"
+PKGETC="${TRIM_PKGETC:-/var/apps/${APPNAME}/etc}"
+PIDFILE="${PKGVAR}/panel.pid"
+LOGFILE="${PKGVAR}/panel.log"
+SERVER_DIR="${APPDEST}/panel"
+STATIC_DIR="${APPDEST}/ui"
+RUNTIME_DIR="${APPDEST}/runtime"
+PORT="${QQFARM_PORT:-8788}"
+
+log()  { echo "[${APPNAME}] $*"; }
+logtmp() {
+  [ -n "${TRIM_TEMP_LOGFILE:-}" ] && echo "[${APPNAME}] $*" >> "${TRIM_TEMP_LOGFILE}"
+  return 0
+}
+
+# 找一个 >=3.8 的 Python：飞牛商店 python312 运行时，或系统 python3（含绝对路径兜底）
+find_python() {
+  export PATH="/var/apps/python312/target/bin:${PATH}"
+  for candidate in python3.12 python3.11 python3.10 python3 python \
+                   /usr/bin/python3 /usr/local/bin/python3 /usr/bin/python3.12; do
+    p="$(command -v "$candidate" 2>/dev/null || true)"
+    [ -z "$p" ] && continue
+    ver="$("$p" -c 'import sys;print(sys.version_info[0]*100+sys.version_info[1])' 2>/dev/null)"
+    if [ -n "$ver" ] && [ "$ver" -ge 308 ] 2>/dev/null; then
+      echo "$p"; return 0
+    fi
+  done
+  return 1
+}
+
+# TCP 端口是否已可连接（1=就绪，0=未就绪）。用后端同一个 Python 探测，零额外依赖。
+port_ready() {
+  [ -n "${PYTHON:-}" ] || return 1
+  "$PYTHON" -c '
+import socket, sys
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(1.0)
+    rc = s.connect_ex(("127.0.0.1", int(sys.argv[1])))
+    s.close()
+    sys.exit(0 if rc == 0 else 1)
+except Exception:
+    sys.exit(1)
+' "$PORT" 2>/dev/null
+}
+
+is_running() {
+  [ -f "$PIDFILE" ] || return 1
+  pid="$(cat "$PIDFILE" 2>/dev/null)"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+start_service() {
+  log "starting ..."
+  if is_running; then log "already running (PID $(cat "$PIDFILE"))"; return 0; fi
+  rm -f "$PIDFILE" 2>/dev/null
+
+  if [ ! -f "${SERVER_DIR}/server.py" ]; then
+    log "ERROR: ${SERVER_DIR}/server.py 不存在"
+    logtmp "应用文件缺失：${SERVER_DIR}/server.py（安装可能不完整，请卸载后重新安装本 fpk）"
+    return 1
+  fi
+
+  PYTHON="$(find_python)"
+  if [ -z "$PYTHON" ]; then
+    log "ERROR: 未找到 Python 3.8+ 运行时"
+    logtmp "未找到 Python 3.8+ 运行时。请先在飞牛应用中心安装「Python 3.12 运行时」，或确认系统已自带 python3 后重试。"
+    return 1
+  fi
+  log "using python: ${PYTHON}"
+
+  mkdir -p "$PKGVAR" "$PKGETC" 2>/dev/null
+
+  # 强制 TCP 模式：清空一切可能触发 socket 分支的变量。
+  unset GATEWAY_SOCKET SOCKET_PATH FNNAS_GATEWAY_SOCKET 2>/dev/null
+  export GATEWAY_PREFIX=""
+  export QQFARM_USE_SOCKET=""
+  export QQFARM_STATIC_DIR="$STATIC_DIR"
+  export QQFARM_RUNTIME_DIR="$RUNTIME_DIR"
+  export QQFARM_PORT="$PORT"
+  # 与后端 default_settings 保持一致：省资源档 1024x768（16bpp 由后端设置控制）
+  export QQFARM_RESOLUTION="${wizard_resolution:-1024x768}"
+  export QQFARM_AUTOSTART="${wizard_autostart:-true}"
+  export QQFARM_PYTHON="$PYTHON"
+  # 面板「检测更新」需要读应用包版本：把随包 manifest 路径传给后端
+  MANIFEST="/var/apps/${APPNAME}/manifest"
+  [ -f "$MANIFEST" ] || MANIFEST="${APPDEST}/../manifest"
+  [ -f "$MANIFEST" ] && export QQFARM_MANIFEST="$MANIFEST"
+
+  DATA_DIR="${QQFARM_DATA_DIR:-${TRIM_DATA_SHARE_PATHS%%:*}}"
+  [ -n "$DATA_DIR" ] || DATA_DIR="${PKGVAR}/data"
+  export QQFARM_DATA_DIR="$DATA_DIR"
+  mkdir -p "$DATA_DIR" 2>/dev/null
+
+  # 清掉可能残留的旧后端，避免端口占用导致本次启动失败。
+  pkill -f "${SERVER_DIR}/server.py" 2>/dev/null || true
+  sleep 0.3
+
+  log "diag: APPDEST=${APPDEST} PYTHON=${PYTHON} PORT=${PORT} DATA=${DATA_DIR}"
+  logtmp "diag: APPDEST=${APPDEST} PYTHON=${PYTHON} PORT=${PORT}"
+
+  cd "$SERVER_DIR" || { log "ERROR: 无法进入 ${SERVER_DIR}"; logtmp "无法进入目录 ${SERVER_DIR}"; return 1; }
+
+  nohup "$PYTHON" "${SERVER_DIR}/server.py" >> "$LOGFILE" 2>&1 &
+  pid=$!
+  echo "$pid" > "$PIDFILE"
+  log "launched (PID $pid), waiting for TCP ${PORT} ..."
+
+  # 轮询 TCP 端口就绪（最长 ~30s）。进程若提前退出则立即停止等待。
+  ready=0
+  i=0
+  while [ "$i" -lt 60 ]; do
+    if port_ready; then ready=1; break; fi
+    kill -0 "$pid" 2>/dev/null || break
+    i=$((i + 1))
+    sleep 0.5
+  done
+
+  if [ "$ready" -eq 1 ]; then
+    log "started, TCP ${PORT} ready (PID $pid)"
+    logtmp "面板已启动：http://127.0.0.1:${PORT}/（PID ${pid}）"
+    return 0
+  fi
+
+  # 未就绪：把后端日志上送应用中心，便于定位；不隐瞒、不制造“假启动”。
+  if kill -0 "$pid" 2>/dev/null; then
+    log "ERROR: 进程在运行但 TCP ${PORT} 未就绪，已结束以便重试"
+    logtmp "面板启动失败：后端进程未在 ${PORT} 端口就绪。后端日志见 ${LOGFILE}；可把该文件内容发开发者排查。"
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 1
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+  else
+    log "ERROR: 后端进程已退出，TCP ${PORT} 未就绪"
+    logtmp "面板启动失败：后端进程启动即退出。后端日志见 ${LOGFILE}；可把该文件内容发开发者排查。"
+  fi
+  rm -f "$PIDFILE" 2>/dev/null
+  log "===== 后端启动日志（${LOGFILE}）====="
+  tail -40 "$LOGFILE" 2>/dev/null | while read -r line; do log "  | $line"; logtmp "  | $line"; done
+  return 1
+}
+
+stop_service() {
+  log "stopping ..."
+  if is_running; then
+    pid="$(cat "$PIDFILE" 2>/dev/null)"
+    # 面板收到 TERM 会优雅停止所有 QQ 子进程
+    kill -TERM "$pid" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.5
+    done
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+  fi
+  # 兜底：清理可能残留的面板 / Xvfb / x11vnc / QQ 进程
+  pkill -f "${SERVER_DIR}/server.py" 2>/dev/null || true
+  pkill -f "Xvfb" 2>/dev/null || true
+  pkill -f "x11vnc" 2>/dev/null || true
+  pkill -f "/opt/QQ/qq" 2>/dev/null || true
+  rm -f "$PIDFILE" 2>/dev/null
+  log "stopped"
+  return 0
+}
+
+status_service() {
+  if is_running; then log "running (PID $(cat "$PIDFILE"))"; return 0; fi
+  echo "not running"
+  return 3
+}
+
+case "${1:-}" in
+  start)    start_service ;;
+  stop)     stop_service ;;
+  status)   status_service ;;
+  restart)  stop_service; sleep 1; start_service ;;
+  *) echo "Usage: $0 {start|stop|status|restart}" >&2; exit 1 ;;
+esac
+exit $?

@@ -1,0 +1,16 @@
+{
+  ".url": {
+    "qqfarm-native.Application": {
+      "title": "QQ挂机仓",
+      "icon": "images/icon_{0}.png",
+      "type": "url",
+      "protocol": "http",
+      "port": "8788",
+      "url": "/",
+      "allUsers": false,
+      "control": {
+        "accessPerm": "readonly"
+      }
+    }
+  }
+}

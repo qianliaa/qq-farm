@@ -1,0 +1,81 @@
+[
+  {
+    "stepTitle": "应用简介",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "<strong>QQ 多开挂机</strong> 会在飞牛 NAS 上为每个 QQ 账号创建一个独立容器，容器内运行<strong>腾讯官方 Linux QQ 客户端</strong>，通过浏览器里的网页桌面（noVNC）扫码登录。登录后即可关闭浏览器，账号会持续在线。"
+      },
+      {
+        "type": "tips",
+        "helpText": "安装完成后，点击应用图标打开<strong>管理面板</strong>：首次使用请设置管理密码，然后点「新增账号」，再点「打开网页桌面」用手机 QQ 扫码即可。账号数量不限，取决于 NAS 内存。"
+      },
+      {
+        "type": "tips",
+        "helpText": "<strong>资源占用：</strong>官方 QQ 是 Electron 客户端，单个账号建议预留 1GB 以上内存，默认上限 1536MB，另需 1GB /dev/shm。2GB 内存的 NAS 建议只挂 1 个号。"
+      }
+    ]
+  },
+  {
+    "stepTitle": "端口设置",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "每个 QQ 账号会占用一个宿主机端口，用于打开网页桌面。请确认下面的端口段没有被飞牛上的其他服务占用；之后也可以在管理面板「设置」里随时调整。"
+      },
+      {
+        "type": "text",
+        "field": "wizard_port_start",
+        "label": "网页桌面端口起始",
+        "initValue": "5801",
+        "rules": [
+          { "required": true, "message": "请填写起始端口" },
+          { "pattern": "^[0-9]+$", "message": "端口只能是数字" }
+        ]
+      },
+      {
+        "type": "text",
+        "field": "wizard_port_end",
+        "label": "网页桌面端口结束",
+        "initValue": "5899",
+        "rules": [
+          { "required": true, "message": "请填写结束端口" },
+          { "pattern": "^[0-9]+$", "message": "端口只能是数字" }
+        ]
+      },
+      {
+        "type": "tips",
+        "helpText": "管理面板本身固定使用 <strong>8787</strong> 端口。若 8787 已被占用，安装前会提示端口冲突。"
+      }
+    ]
+  },
+  {
+    "stepTitle": "重要提示",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "<strong>权限说明：</strong>为了实现「动态增删账号」，管理面板需要挂载宿主机的 Docker Socket（等价于较高的系统权限）。请只安装可信来源的应用，并<strong>不要把这个面板暴露到公网</strong>。"
+      },
+      {
+        "type": "tips",
+        "helpText": "<strong>账号风险：</strong>在服务器 / 容器环境长期挂机可能被 QQ 判定为异常登录，出现要求重新扫码、滑块验证乃至风控限制。请勿使用重要账号，相关后果由使用者自行评估承担。"
+      },
+      {
+        "type": "tips",
+        "helpText": "<strong>数据安全：</strong>每个账号的 QQ 登录态保存在独立的 Docker 命名卷中，卸载应用不会自动删除；卸载向导中可选择是否清除。请自行做好备份。"
+      },
+      {
+        "type": "tips",
+        "helpText": "本应用由第三方打包，QQ 客户端版权归腾讯所有，容器镜像来自社区项目 libzonda/Linux-QQ-release。如遇问题请不要向飞牛官方或腾讯反馈。"
+      },
+      {
+        "type": "switch",
+        "field": "wizard_ack",
+        "label": "我已阅读并理解上述资源、权限与账号风险提示",
+        "rules": [
+          { "required": true, "message": "请先确认已阅读并理解上述提示" }
+        ]
+      }
+    ]
+  }
+]

@@ -1,0 +1,15 @@
+#!/bin/bash
+# 卸载前：停掉面板与所有 QQ 子进程。默认保留账号数据；
+# 只有在卸载向导里明确选择「全部删除」时才清理应用自己创建的文件。
+MYDIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
+[ -x "$MYDIR/main" ] && "$MYDIR/main" stop >/dev/null 2>&1 || true
+if [ "${wizard_purge:-no}" = "yes" ]; then
+    DATA_DIR="${QQFARM_DATA_DIR:-${TRIM_DATA_SHARE_PATHS%%:*}}"
+    if [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR" ]; then
+        # 只删除本应用自己创建的内容，不动共享目录里的其他文件
+        rm -rf "${DATA_DIR}/accounts" "${DATA_DIR}/logs" 2>/dev/null || true
+        rm -f "${DATA_DIR}/state.json" "${DATA_DIR}/auth.json" \
+              "${DATA_DIR}/sessions.json" "${DATA_DIR}/pids.json" 2>/dev/null || true
+    fi
+fi
+exit 0

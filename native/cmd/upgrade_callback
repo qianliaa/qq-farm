@@ -1,0 +1,8 @@
+#!/bin/bash
+### 升级后：重启面板以加载新代码；账号进程会按 autostart 设置恢复。
+MYDIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
+if [ -x "$MYDIR/main" ]; then
+    "$MYDIR/main" stop >/dev/null 2>&1 || true
+    "$MYDIR/main" start >/dev/null 2>&1 || true
+fi
+exit 0

@@ -1,0 +1,15 @@
+#!/bin/bash
+# 安装前检查：Docker 必须可用，且面板代码必须随包一起解压出来。
+LOGFILE="${TRIM_TEMP_LOGFILE:-/tmp/qqfarm-error.log}"
+
+fail() {
+    echo "$1" > "$LOGFILE"
+    exit 1
+}
+
+command -v docker >/dev/null 2>&1 || fail "未找到 docker 命令：请先在飞牛「应用中心 / Docker」中启用 Docker 服务，再安装本应用。"
+docker version >/dev/null 2>&1 || fail "Docker 服务不可用或当前用户无权访问，请检查 Docker 服务状态后重试。"
+[ -f "${TRIM_APPDEST}/docker/panel/server.py" ] || fail "应用包不完整：缺少面板代码 ${TRIM_APPDEST}/docker/panel/server.py"
+[ -f "${TRIM_APPDEST}/docker/panel/static/index.html" ] || fail "应用包不完整：缺少面板页面文件。"
+
+exit 0

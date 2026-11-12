@@ -1,0 +1,25 @@
+[
+  {
+    "stepTitle": "卸载确认",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "卸载会停止所有 QQ 进程与面板进程。<strong>默认保留账号数据</strong>（QQ 登录态、聊天缓存、面板配置），重新安装后可以恢复。"
+      },
+      {
+        "type": "tips",
+        "helpText": "如果选择「全部删除」，所有账号数据会被永久移除，无法恢复。账号数据位于应用共享目录，也可以自行在文件管理器里备份。"
+      },
+      {
+        "type": "select",
+        "field": "wizard_purge",
+        "label": "账号数据处理",
+        "initValue": "no",
+        "options": [
+          { "label": "保留数据（推荐，便于以后重装）", "value": "no" },
+          { "label": "全部删除（不可恢复）", "value": "yes" }
+        ]
+      }
+    ]
+  }
+]

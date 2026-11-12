@@ -1,0 +1,27 @@
+#!/bin/bash
+# 安装前：确认解释器与包内文件齐全。图形栈二进制由构建脚本放进 app/runtime/。
+LOGFILE="${TRIM_TEMP_LOGFILE:-/tmp/qqfarm-native-error.log}"
+for candidate in /var/apps/python312/target/bin /var/apps/python311/target/bin /var/apps/python310/target/bin; do
+    if [ -x "$candidate/python3" ]; then export PATH="$candidate:$PATH"; break; fi
+done
+PY=$(command -v python3 2>/dev/null)
+[ -n "$PY" ] || PY=/usr/bin/python3
+if [ ! -x "$PY" ]; then
+    echo "找不到 Python 解释器：请在飞牛应用中心安装「Python 3.12 运行时」后重试。" > "$LOGFILE"
+    exit 1
+fi
+# app.tgz 解包到 $TRIM_APPDEST 根（无额外 app/ 层），面板在 $TRIM_APPDEST/panel/server.py
+PANEL="${TRIM_APPDEST}/panel/server.py"
+[ -f "$PANEL" ] || PANEL="${TRIM_APPDEST}/app/panel/server.py"
+if [ ! -f "$PANEL" ]; then
+    # 仅当面板目录已存在却缺文件时才判定为包不完整；
+    # 若目录尚未生成（install_init 可能早于 app.tgz 解包执行），仅告警，不阻断安装，
+    # 真正的缺文件会在 cmd/main start 时再次校验。
+    if [ -d "${TRIM_APPDEST}/panel" ] || [ -d "${TRIM_APPDEST}/app/panel" ]; then
+        echo "应用包不完整：缺少面板代码（期望 ${TRIM_APPDEST}/panel/server.py）。" > "$LOGFILE"
+        exit 1
+    fi
+    echo "提示：安装阶段尚未检测到面板代码（${PANEL}），将在应用启动时再校验。" > "$LOGFILE"
+fi
+mkdir -p "${TRIM_PKGVAR}" 2>/dev/null || true
+exit 0

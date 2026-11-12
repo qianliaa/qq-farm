@@ -1,0 +1,46 @@
+# QQ 多开挂机 · 面板容器
+# 说明：${TRIM_APPDEST} 由飞牛应用中心注入（官方写法）；
+#       ${wizard_...:-默认值} 由 Docker Compose 解析，向导变量未注入时也有安全默认值。
+#       面板镜像写死为 python:3.11-alpine，国内拉不动时可用
+#       python tools/build.py --panel-image <加速地址> 重新打包。
+services:
+  qqfarm-panel:
+    image: python:3.11-alpine
+    container_name: qqfarm-panel
+    restart: unless-stopped
+    stop_grace_period: 15s
+    command: ["python", "-u", "/app/server.py"]
+    environment:
+      TZ: Asia/Shanghai
+      PANEL_PORT: "8787"
+      DATA_DIR: /data
+      DOCKER_SOCKET: /var/run/docker.sock
+      PORT_START: "${wizard_port_start:-5801}"
+      PORT_END: "${wizard_port_end:-5899}"
+      DEFAULT_MEMORY_MB: "1536"
+      SHM_MB: "1024"
+    ports:
+      - "8787:8787"
+    volumes:
+      # 面板需要调用宿主机 Docker API 来动态创建 / 管理各 QQ 容器
+      - /var/run/docker.sock:/var/run/docker.sock
+      # 面板代码随应用一起安装，只读挂载（官方推荐的 ${TRIM_APPDEST} 写法）
+      # 若个别 fnOS 版本未注入该变量，可改成相对路径： - ./panel:/app:ro
+      - ${TRIM_APPDEST}/docker/panel:/app:ro
+      # 账号清单、设置、管理密码、会话
+      - qqfarm-panel-data:/data
+    labels:
+      qqfarm.managed: "panel"
+      qqfarm.role: "panel"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/api/bootstrap', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  qqfarm-panel-data:
+    name: qqfarm-panel-data
+    labels:
+      qqfarm.managed: "1"

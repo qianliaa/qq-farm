@@ -1,0 +1,16 @@
+#!/bin/bash
+# 卸载前：清理面板动态创建出来的 QQ 容器，避免卸载后留下孤儿容器。
+# 登录数据卷默认保留（向导选择「全部删除」时才清理）。
+ids=$(docker ps -aq --filter "label=qqfarm.account" 2>/dev/null)
+if [ -n "$ids" ]; then
+    docker rm -f $ids >/dev/null 2>&1 || true
+fi
+
+if [ "${wizard_purge:-no}" = "yes" ]; then
+    vols=$(docker volume ls -q --filter "label=qqfarm.managed=1" 2>/dev/null)
+    if [ -n "$vols" ]; then
+        docker volume rm $vols >/dev/null 2>&1 || true
+    fi
+fi
+
+exit 0

@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QQ挂机仓</title>
+<link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+<section id="auth-screen" class="auth-wrap hidden">
+  <div class="auth-card">
+    <div class="brand">
+      <div class="brand-mark"><span>Q</span><span>Q</span></div>
+      <div>
+        <h1>QQ挂机仓</h1>
+        <p class="muted">飞牛 NAS · 原生版（无 Docker）</p>
+      </div>
+    </div>
+    <div id="auth-notice" class="notice hidden"></div>
+    <h2 id="auth-title">登录</h2>
+    <p id="auth-desc" class="muted small">请输入管理密码</p>
+    <form id="auth-form">
+      <label class="field">
+        <span id="auth-label">管理密码</span>
+        <input id="auth-password" type="password" autocomplete="current-password" required minlength="8" placeholder="至少 8 位">
+      </label>
+      <label class="field hidden" id="auth-confirm-field">
+        <span>确认密码</span>
+        <input id="auth-confirm" type="password" autocomplete="new-password" placeholder="再输入一次">
+      </label>
+      <button id="auth-submit" class="btn primary block" type="submit">登录</button>
+    </form>
+    <p class="muted tiny auth-foot">原生模式：面板由飞牛 Python 运行时驱动，每个 QQ 是一组独立进程，不依赖 Docker。</p>
+  </div>
+</section>
+<section id="main-screen" class="hidden">
+  <header class="topbar">
+    <div class="brand compact">
+      <div class="brand-mark small"><span>Q</span><span>Q</span></div>
+      <div>
+        <h1>QQ挂机仓 <span class="muted tiny">原生版</span></h1>
+        <p class="muted tiny" id="header-sub">飞牛 NAS 应用</p>
+      </div>
+    </div>
+    <div class="top-actions">
+      <span id="runtime-badge" class="badge">检查中</span>
+      <button class="btn ghost" id="btn-settings">设置</button>
+      <button class="btn ghost" id="btn-logout">退出</button>
+    </div>
+  </header>
+  <main class="container">
+    <div class="summary">
+      <div class="stat"><span class="stat-label">账号总数</span><strong id="stat-total">0</strong></div>
+      <div class="stat"><span class="stat-label">运行中</span><strong id="stat-running" class="green">0</strong></div>
+      <div class="stat"><span class="stat-label">已停止</span><strong id="stat-stopped" class="amber">0</strong></div>
+      <div class="stat"><span class="stat-label">进程异常</span><strong id="stat-missing" class="red">0</strong></div>
+    </div>
+    <div id="runtime-banner" class="banner hidden">
+      <div>
+        <strong id="runtime-title">图形栈未就绪</strong>
+        <p class="muted small" id="runtime-desc"></p>
+      </div>
+      <button class="btn primary" id="btn-setup">立即准备</button>
+    </div>
+    <div id="alert" class="alert hidden"></div>
+    <div class="toolbar">
+      <div>
+        <h2>我的 QQ</h2>
+        <p class="muted small" id="port-hint">所有网页桌面共用面板端口，无需为每个账号开放端口</p>
+      </div>
+      <div class="toolbar-actions">
+        <label class="switch-label"><input type="checkbox" id="auto-refresh" checked><span>自动刷新</span></label>
+        <button class="btn ghost" id="btn-refresh">刷新</button>
+        <button class="btn primary" id="btn-add">＋ 新增账号</button>
+      </div>
+    </div>
+    <div id="accounts" class="grid"></div>
+    <div id="empty" class="empty hidden">
+      <div class="empty-icon">＋</div>
+      <h3>还没有挂任何 QQ</h3>
+      <p class="muted">点「新增账号」创建第一个实例，然后打开网页桌面用手机 QQ 扫码即可常驻在线。</p>
+      <button class="btn primary" id="btn-add-empty">新增账号</button>
+    </div>
+    <footer class="foot muted tiny">
+      原生进程 · 无 Docker Socket · 每账号独立 HOME 与登录数据 · 数据存放在应用共享目录，卸载默认保留 · 本应用为第三方工具，与腾讯无关
+    </footer>
+  </main>
+</section>
+<div id="modal-root" class="modal-root hidden">
+  <div class="modal-backdrop" id="modal-backdrop"></div>
+  <div class="modal" role="dialog" aria-modal="true">
+    <div class="modal-head">
+      <h3 id="modal-title">标题</h3>
+      <button class="icon-btn" id="modal-close" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-foot" id="modal-foot"></div>
+  </div>
+</div>
+<div id="toasts" class="toasts"></div>
+<script>
+  // 计算应用基础路径：飞牛统一网关下页面在 /app/qqfarm-native/，本地开发在 /。
+  // 去掉 /static/... 后缀并去掉结尾斜杠，保证后续 API/桌面链接都带对前缀。
+  window.QQBASE = location.pathname.replace(/\/static\/.*$/, '').replace(/\/$/, '');
+</script>
+<script src="static/app.js"></script>
+</body>
+</html>

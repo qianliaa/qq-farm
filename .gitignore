@@ -1,53 +1,12 @@
-# 运行数据与本地调试产物
-data/
-.tmp*/
-.pkgtest*/
-.tmp-fpk-check*/
-fnos-fpk/.build/
+# 构建产物与本地缓存
+__pycache__/
+*.pyc
+dist/
+qqfarm-native.fpk
 
-# 本地凭证
-.gh-token*
-
-# 本地工作区记忆（不进公开仓库）
+# 本地工作区数据（含项目记忆/日志，不入库）
 .workbuddy/
 
-# 构建产物（历史版本不跟踪，当前版本随仓库提供直接下载）
-fnos-fpk/dist/*
-!fnos-fpk/dist/qqnas_2.0.6_all.fpk
-!fnos-fpk/dist/qqnas_2.0.7_all.fpk
-!fnos-fpk/dist/qqnas_2.0.8_all.fpk
-!fnos-fpk/dist/qqnas_2.0.9_all.fpk
-!fnos-fpk/dist/qqnas_2.0.10_all.fpk
-!fnos-fpk/dist/qqnas_2.0.11_all.fpk
-!fnos-fpk/dist/qqnas_2.0.12_all.fpk
-!fnos-fpk/dist/qqnas_2.0.13_all.fpk
-!fnos-fpk/dist/qqnas_2.0.14_all.fpk
-!fnos-fpk/dist/qqnas_2.0.15_all.fpk
-!fnos-fpk/dist/qqnas_2.0.16_all.fpk
-!fnos-fpk/dist/qqnas_2.0.17_all.fpk
-!fnos-fpk/dist/qqnas_2.0.18_all.fpk
-!fnos-fpk/dist/qqnas_2.0.19_all.fpk
-!fnos-fpk/dist/qqnas_2.0.20_all.fpk
-
-# 2.0.0 起改用飞牛原生运行时，以下旧 Docker 文件不再参与构建
-docker-compose.yml
-install.sh
-.env
-.env.example
-manager/lib/docker.cjs
-fnos-fpk/fpk-src/app/docker/
-fnos-fpk/offline-images.sh
-
-# 界面预览图
-preview*.png
-
-# 系统与依赖
-.DS_Store
-Thumbs.db
-node_modules/
-
-# 本地解包中间目录与构建产物（不进仓库）
-2.0.20/
-app.tgz
-/*.fpk
-.trae-html-share-packages/
+# 飞牛官方打包器 fnpack.exe（3.8MB 二进制）不入库，
+# 构建前请从 https://developer.fnnas.com/ 下载放到 tools/ 下
+tools/fnpack.exe
