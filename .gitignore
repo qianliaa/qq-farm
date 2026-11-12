@@ -4,6 +4,10 @@ __pycache__/
 dist/
 qqfarm-native.fpk
 
+# Docker 本地数据（账号 / 登录态 / QQ deb）
+data/
+qq/
+
 # 本地工作区数据（含项目记忆/日志，不入库）
 .workbuddy/
 

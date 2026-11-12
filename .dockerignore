@@ -1,0 +1,11 @@
+.git
+.github
+.workbuddy
+__pycache__
+*.pyc
+dist
+*.fpk
+tools
+fpk
+data
+qq

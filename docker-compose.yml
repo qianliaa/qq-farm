@@ -1,0 +1,18 @@
+services:
+  qq-farm:
+    image: ghcr.io/qianliaa/qq-farm:latest
+    container_name: qq-farm
+    restart: unless-stopped
+    stop_grace_period: 30s
+    ports:
+      - "8788:8788"
+    environment:
+      TZ: Asia/Shanghai
+      QQFARM_PORT: "8788"
+    volumes:
+      # 账号、登录态、运行时与配置
+      - ./data:/data
+      # 可选：把官方 Linux QQ 的 deb 放进 ./qq，启动时自动解包
+      - ./qq:/qq:ro
+    # 官方 QQ 是 Electron 应用，共享内存给足一些
+    shm_size: "1gb"

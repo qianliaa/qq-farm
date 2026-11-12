@@ -1,7 +1,9 @@
 # QQ挂机仓（qq-farm）
 
 一个可以装进**飞牛私有云 fnOS 应用中心**的第三方原生应用：在 NAS 上同时常驻多个 QQ 账号，
-浏览器里扫码登录，关掉页面账号依然在线。**不依赖 Docker、不用 NapCat 等第三方协议端，跑的是腾讯官方 Linux QQ 客户端。**
+浏览器里扫码登录，关掉页面账号依然在线。使用腾讯官方 Linux QQ 客户端，不用 NapCat 等第三方协议端。
+
+提供两种部署方式：**飞牛 fnOS 原生 FPK**（不依赖 Docker）与 **Docker 镜像**（群晖、Unraid、普通 Linux 均可）。
 
 - 开发者 / 发布者：千里
 - 适用系统：飞牛 fnOS（x86_64 / ARM 通用）
@@ -15,6 +17,25 @@
 4. 创建账号 → 打开网页桌面 → 手机 QQ 扫码。
 
 已安装的用户也可以在面板「设置 → 版本与更新」里**一键检测更新**（默认读取本仓库 Releases）。
+
+## Docker 部署
+
+镜像：`ghcr.io/qianliaa/qq-farm:latest`（`linux/amd64`、`linux/arm64`）
+
+```bash
+mkdir -p qq-farm/data qq-farm/qq && cd qq-farm
+curl -O https://raw.githubusercontent.com/qianliaa/qq-farm/main/docker-compose.yml
+docker compose up -d
+```
+
+1. 把官方 Linux QQ 的 deb 放进 `qq/` 后执行 `docker compose restart`（也可在面板「环境准备 → 方式 A」填下载直链）；
+2. 打开 `http://<NAS>:8788/`，首次设置管理密码；
+3. 新增账号 → 打开网页桌面 → 手机 QQ 扫码。
+
+- 镜像已内置 Xvfb、x11vnc、noVNC 与 Electron 运行库，**不包含 QQ 客户端**（版权归腾讯，需自行从 [im.qq.com/linuxqq](https://im.qq.com/linuxqq/) 下载对应架构的 deb）
+- `./data` 持久化账号、登录态与运行时；`./qq` 只读挂载 deb，容器重建不丢数据
+- 只暴露 8788；每个账号的 VNC 仅在容器内回环监听，经带登录校验的 WebSocket 转发
+- 单账号建议预留 1GB 以上内存；ARM 设备请选 `arm64` 架构的 QQ deb
 
 ## 功能一览
 
@@ -33,6 +54,7 @@
 
 ```
 native/     原生版 FPK 源码（面板 Python 后端 + 前端 + 生命周期脚本）
+docker/     Docker 部署（Dockerfile + 容器启动脚本）
 fpk/        早期 Docker 版源码（已不推荐，仅留档）
 tools/      校验 / 测试 / 打包脚本（fnpack.exe 需自行从飞牛开发者站下载）
 dist/       本地产物（不入库，正式包见 Releases）
@@ -50,6 +72,16 @@ python tools/build-native-check.py
 python tools/test_native_panel.py   # 56 项回归
 python tools/test_native_diag.py    # 崩溃诊断 / 色深 / 更新检查等专项
 ```
+
+Docker 镜像：
+
+```bash
+docker build -f docker/Dockerfile -t qq-farm .
+docker run -d --name qq-farm -p 8788:8788 \
+  -v "$PWD/data:/data" -v "$PWD/qq:/qq:ro" --shm-size=1g qq-farm
+```
+
+推送到 `main` 或打 `v*` 标签时，GitHub Actions 会自动构建并推送 GHCR 镜像（amd64 / arm64）。
 
 ## 声明
 
