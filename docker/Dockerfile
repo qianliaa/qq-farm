@@ -8,7 +8,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     QQFARM_PORT=8788 \
     QQFARM_DATA_DIR=/data \
     QQFARM_RUNTIME_DIR=/data/runtime \
-    QQFARM_STATIC_DIR=/app/ui
+    QQFARM_STATIC_DIR=/app/ui \
+    QQFARM_MANIFEST=/app/manifest \
+    QQFARM_DEPLOY=docker
 
 # 图形栈 + 官方 Linux QQ（Electron）运行库。
 # 保留 apt 索引，面板「环境准备」里的 apt-get download 自愈仍可工作。
@@ -65,6 +67,8 @@ RUN apt-get update \
 WORKDIR /app
 COPY native/app/panel/ /app/panel/
 COPY native/app/ui/ /app/ui/
+# manifest：面板「检测更新」读当前版本用；QQFARM_DEPLOY：让面板显示 Docker 专属更新指引
+COPY native/manifest /app/manifest
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh && mkdir -p /data /qq
 

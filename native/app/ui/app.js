@@ -357,6 +357,7 @@ function showSettings() {
     <div class="divider"></div>
     <div class="section-title">版本与更新</div>
     <div class="kv"><span>当前版本</span><span>v${esc(STATE.app_version || '-')}</span></div>
+    <div class="kv"><span>部署方式</span><span>${STATE.deploy === 'docker' ? 'Docker（更新：拉取新镜像并重建容器）' : '飞牛应用（更新：应用中心安装新版 .fpk）'}</span></div>
     <form id="update-form">
       <label class="field"><span>更新源地址</span>
         <input name="update_url" maxlength="300" value="${esc(s.update_url || '')}" placeholder="https://api.github.com/repos/qianliaa/qq-farm/releases/latest"><span class="hint">检测更新时访问的 GitHub Releases 接口地址；留空则禁用检测更新。改动后点「保存设置」再检测。</span></label>
@@ -431,6 +432,7 @@ async function checkUpdate(source) {
   finally { if (btn) { btn.disabled = false; btn.textContent = '检测更新'; } }
 }
 function showUpdateResult(r) {
+  const docker = STATE.deploy === 'docker';
   let body;
   if (r.error) {
     body = `<p class="red">${esc(r.error)}</p>
@@ -438,8 +440,10 @@ function showUpdateResult(r) {
   } else if (r.has_update) {
     body = `<p>发现新版本：<strong>v${esc(r.latest)}</strong>（当前 v${esc(r.current)}）</p>
       ${r.changelog ? `<div class="section-title">更新内容</div><pre class="tiny" style="white-space:pre-wrap;word-break:break-all;max-height:200px;overflow:auto;background:var(--bg,#111);padding:10px;border-radius:8px">${esc(r.changelog)}</pre>` : ''}
-      ${r.download && r.download.url ? `<p><a class="btn primary tiny" href="${esc(r.download.url)}" target="_blank" rel="noopener">下载安装包 ${r.download.name || ''}</a></p>
-      <p class="muted tiny">下载 .fpk 后，在飞牛应用中心手动安装（会保留账号数据），或先卸载旧版再安装。</p>` : ''}`;
+      ${docker
+        ? `<p class="muted tiny">当前为 Docker 部署：在宿主机执行 <code>docker compose pull</code> 拉取新镜像，再 <code>docker compose up -d</code> 重建容器即可，数据目录（./data）会保留。.fpk 安装包仅用于飞牛应用中心安装方式。</p>`
+        : `${r.download && r.download.url ? `<p><a class="btn primary tiny" href="${esc(r.download.url)}" target="_blank" rel="noopener">下载安装包 ${r.download.name || ''}</a></p>
+      <p class="muted tiny">下载 .fpk 后，在飞牛应用中心手动安装（会保留账号数据），或先卸载旧版再安装。</p>` : ''}`}`;
   } else {
     body = `<p>已是最新版本（v${esc(r.current)}）${r.latest ? `，云端版本 v${esc(r.latest)}` : ''}。</p>`;
   }

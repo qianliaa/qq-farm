@@ -4,7 +4,7 @@
     "items": [
       {
         "type": "tips",
-        "helpText": "<strong>QQ挂机仓</strong>：不依赖 Docker 的原生应用，可在浏览器里给多个 QQ 扫码登录并长期挂机，关掉页面账号仍在线。安装时会自动装上商店的「Python 3.12 运行时」；QQ 客户端与图形组件在首次打开面板时点「环境准备」一键下载，全程无需 root / SSH。"
+        "helpText": "<strong>QQ挂机仓</strong>：原生运行、无需 Docker 的飞牛应用，可在浏览器里给多个 QQ 扫码登录并长期挂机，关掉页面账号仍在线。安装时会自动装上商店的「Python 3.12 运行时」；QQ 客户端与图形组件在首次打开面板时点「环境准备」一键下载，全程无需 root / SSH。（非飞牛环境也可用 Docker 部署，见项目主页 README。）"
       },
       {
         "type": "tips",

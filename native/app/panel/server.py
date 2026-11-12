@@ -27,13 +27,17 @@ from pathlib import Path
 import procman
 import wsproxy
 import setup_runtime
-PANEL_VERSION = "2.3.0-native"
+PANEL_VERSION = "2.4.0-native"
 # 应用包版本（manifest 的 version）：优先读随包 manifest（cmd/main 注入
 # QQFARM_MANIFEST），本地开发 / 读不到时用内置兜底值，与 manifest 保持同步。
-APP_VERSION_FALLBACK = "1.0.14"
+APP_VERSION_FALLBACK = "1.0.15"
 # 默认更新源：GitHub Releases 的 latest 接口（返回 JSON：tag_name/body/html_url/assets）。
 # 面板「设置 → 版本与更新」里可改。仓库改名后 GitHub 会对旧地址自动重定向。
 DEFAULT_UPDATE_URL = "https://api.github.com/repos/qianliaa/qq-farm/releases/latest"
+# 部署方式：fnos（飞牛应用中心 FPK）/ docker（容器部署，Dockerfile 里注入
+# QQFARM_DEPLOY=docker）。前端据此给出对应的更新指引——Docker 用户更新靠
+# 重建镜像，用不上 .fpk 安装包。
+DEPLOY_MODE = os.environ.get("QQFARM_DEPLOY") or "fnos"
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = Path(os.environ.get("QQFARM_STATIC_DIR", str(BASE_DIR / "static")))
 DATA_DIR = Path(os.environ.get("QQFARM_DATA_DIR", str(BASE_DIR / "data")))
@@ -400,6 +404,7 @@ def make_state_payload() -> dict:
         "ok": True,
         "panel_version": PANEL_VERSION,
         "app_version": app_version(),
+        "deploy": DEPLOY_MODE,
         "accounts": views,
         "settings": STATE["settings"],
         "summary": {

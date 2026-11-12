@@ -185,6 +185,24 @@ def test_cmd_main():
     expect("仍导出 QQFARM_DATA_DIR", 'export QQFARM_DATA_DIR="$DATA_DIR"' in text)
 
 
+def test_deploy_mode():
+    print("[7] 部署方式上报（Docker / 飞牛应用）")
+    with tempfile.TemporaryDirectory() as d:
+        srv = fresh_server(Path(d))
+        expect("默认部署方式 fnos", srv.DEPLOY_MODE == "fnos", srv.DEPLOY_MODE)
+        os.environ["QQFARM_DEPLOY"] = "docker"
+        srv = importlib.reload(srv)
+        expect("Dockerfile 注入后为 docker", srv.DEPLOY_MODE == "docker", srv.DEPLOY_MODE)
+        expect("state payload 含 deploy", '"deploy": DEPLOY_MODE' in
+               io_text(srv.__file__), "state payload 未包含 deploy 字段")
+        os.environ.pop("QQFARM_DEPLOY", None)
+
+
+def io_text(path):
+    import io
+    return io.open(path, encoding="utf-8").read()
+
+
 def main():
     test_default_runtime_dir()
     test_env_override()
@@ -192,6 +210,7 @@ def main():
     test_cache_detect()
     test_auto_restore()
     test_cmd_main()
+    test_deploy_mode()
     print(f"\n全部通过：{PASS} 项断言")
 
 
