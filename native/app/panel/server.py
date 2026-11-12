@@ -27,17 +27,23 @@ from pathlib import Path
 import procman
 import wsproxy
 import setup_runtime
-PANEL_VERSION = "2.2.0-native"
+PANEL_VERSION = "2.3.0-native"
 # 应用包版本（manifest 的 version）：优先读随包 manifest（cmd/main 注入
 # QQFARM_MANIFEST），本地开发 / 读不到时用内置兜底值，与 manifest 保持同步。
-APP_VERSION_FALLBACK = "1.0.13"
+APP_VERSION_FALLBACK = "1.0.14"
 # 默认更新源：GitHub Releases 的 latest 接口（返回 JSON：tag_name/body/html_url/assets）。
 # 面板「设置 → 版本与更新」里可改。仓库改名后 GitHub 会对旧地址自动重定向。
 DEFAULT_UPDATE_URL = "https://api.github.com/repos/qianliaa/qq-farm/releases/latest"
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = Path(os.environ.get("QQFARM_STATIC_DIR", str(BASE_DIR / "static")))
 DATA_DIR = Path(os.environ.get("QQFARM_DATA_DIR", str(BASE_DIR / "data")))
-RUNTIME_DIR = Path(os.environ.get("QQFARM_RUNTIME_DIR", str(BASE_DIR.parent / "runtime")))
+# 运行时目录（QQ 客户端 / Xvfb / VNC / noVNC / deb 依赖库 / setup-status.json）
+# 必须落在持久化的数据目录里。1.0.13 及之前放在 ${APPDEST}/runtime（安装目录），
+# 每次升级 fpk 覆盖安装目录都会把它整体清空 —— 用户看到的就是「每次更新完都
+# 提示图形栈未就绪、缺少 qq」，得重新下载一遍上百 MB 的客户端。
+# 数据目录与账号数据同级（@appshare 共享目录），升级不会丢。
+LEGACY_RUNTIME_DIR = BASE_DIR.parent / "runtime"
+RUNTIME_DIR = Path(os.environ.get("QQFARM_RUNTIME_DIR") or str(DATA_DIR / "runtime"))
 PANEL_PORT = 8788
 try:
     PANEL_PORT = int(os.environ.get("QQFARM_PORT", "8788"))
@@ -182,6 +188,75 @@ def default_settings() -> dict:
     }
 def default_state() -> dict:
     return {"version": 2, "accounts": [], "settings": default_settings()}
+def _dir_has_files(path: Path) -> bool:
+    try:
+        return path.is_dir() and any(path.iterdir())
+    except OSError:
+        return False
+def migrate_runtime() -> None:
+    """把旧位置（安装目录 runtime）的运行时搬进数据目录（一次性）。
+
+    RUNTIME_DIR 从 1.0.14 起改到数据目录；升级时若旧位置侥幸还在（安装器没清），
+    直接搬走，用户就不必重新下载 QQ 客户端。搬完旧目录留下空壳也无所谓。
+    """
+    if RUNTIME_DIR == LEGACY_RUNTIME_DIR:
+        return
+    if _dir_has_files(RUNTIME_DIR):
+        return  # 新位置已有内容，不覆盖
+    if not _dir_has_files(LEGACY_RUNTIME_DIR):
+        return
+    try:
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        entries = list(LEGACY_RUNTIME_DIR.iterdir())
+    except OSError as exc:
+        log(f"读取旧运行时目录失败：{exc}")
+        return
+    moved = 0
+    for item in entries:
+        target = RUNTIME_DIR / item.name
+        if target.exists():
+            continue
+        try:
+            shutil.move(str(item), str(target))
+            moved += 1
+        except Exception as exc:
+            log(f"迁移运行时 {item.name} 失败：{exc}")
+    if moved:
+        log(f"已把安装目录里的运行时迁移到数据目录（{moved} 项），以后升级不会再丢")
+def runtime_cache_available() -> bool:
+    """本地是否留着上次准备运行时的下载缓存。
+
+    升级覆盖安装目录会把 runtime 清空，但 data/downloads（novnc.tar.gz、qq.deb、
+    debs/）是持久的，有缓存就能只解包、不重新下载，几秒到几十秒即可恢复。
+    """
+    cache = DATA_DIR / "downloads"
+    try:
+        if cache.is_dir() and any(cache.iterdir()):
+            return True
+    except OSError:
+        pass
+    return (DATA_DIR / "runtime-setup.log").is_file()
+def auto_restore_runtime() -> bool:
+    """运行时缺失但本地有缓存时，后台自动重跑环境准备。
+
+    升级后打开面板不再需要手动点「立即准备」；装过的号在准备完成后会自动拉起。
+    """
+    if PM is None or INSTALL["running"]:
+        return False
+    try:
+        if PM.preflight()["ready"]:
+            return False
+    except Exception:
+        return False
+    if not runtime_cache_available():
+        return False
+    log("运行时缺失但本地有下载缓存，后台自动恢复（无需重新下载）")
+    try:
+        start_runtime_install({})
+    except Exception as exc:
+        log(f"自动恢复运行时失败：{exc}")
+        return False
+    return True
 def init_storage() -> None:
     global STATE, AUTH, SESSIONS
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -511,7 +586,14 @@ def start_runtime_install(options: dict) -> str:
                 INSTALL["finished"] = True
             if PM:
                 # 让下一次 preflight 反映最新文件状态
-                PM.preflight()
+                pre = PM.preflight()
+                if pre["ready"]:
+                    # 运行时补齐后自动把账号重新拉起来：升级后、首次准备后都不必
+                    # 再手动逐个点「启动」（账号的 enabled 状态本来就记着）。
+                    try:
+                        restore_accounts()
+                    except Exception as exc:
+                        log(f"准备完成后自动启动账号失败：{exc}")
     threading.Thread(target=worker, name="qqfarm-setup", daemon=True).start()
     return "环境准备已开始，请查看下方进度"
 def read_setup_log() -> list[str]:
@@ -910,9 +992,11 @@ def run(host: str = "0.0.0.0", port: int | None = None):
         log(f"原生管理面板已监听 {host}:{port}（数据目录 {DATA_DIR}）")
     # 2) 再做初始化；任何失败都只记录 BOOT_ERROR，不阻止 socket 已就绪。
     try:
+        migrate_runtime()
         init_storage()
         init_process_manager()
         restore_accounts()
+        auto_restore_runtime()
         if PM and STATE["settings"].get("watchdog", True):
             try:
                 PM.watchdog(

@@ -218,20 +218,20 @@ def test_update_check():
 
     # 有新版本 + fpk 附件
     server.urllib.request.urlopen = fake_urlopen({
-        "tag_name": "v1.0.14", "body": "修复若干问题",
-        "html_url": "https://github.com/qianliaa/qq-farm/releases/v1.0.14",
-        "assets": [{"name": "qqfarm-native-1.0.14.fpk",
-                    "browser_download_url": "https://example.com/qqfarm-native-1.0.14.fpk",
+        "tag_name": "v99.0.0", "body": "修复若干问题",
+        "html_url": "https://github.com/qianliaa/qq-farm/releases/v99.0.0",
+        "assets": [{"name": "qqfarm-native-99.0.0.fpk",
+                    "browser_download_url": "https://example.com/qqfarm-native-99.0.0.fpk",
                     "size": 12345}],
     })
     r = server.check_update("https://example.com/x.json")
     expect("识别到新版本", r.get("has_update") is True, str(r))
-    expect("拿到最新版本号", r.get("latest") == "1.0.14", str(r))
+    expect("拿到最新版本号", r.get("latest") == "99.0.0", str(r))
     expect("拿到 fpk 下载地址", r["download"]["url"].endswith(".fpk"), str(r))
     expect("拿到更新说明", "修复" in r.get("changelog", ""), str(r))
 
     # 已是最新
-    server.urllib.request.urlopen = fake_urlopen({"tag_name": "v1.0.13", "body": "", "html_url": "x", "assets": []})
+    server.urllib.request.urlopen = fake_urlopen({"tag_name": "v" + server.app_version(), "body": "", "html_url": "x", "assets": []})
     r = server.check_update("https://example.com/x.json")
     expect("已是最新版本", r.get("has_update") is False, str(r))
     expect("无附件时退回发布页", r["download"]["url"] == "x", str(r))

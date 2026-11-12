@@ -164,7 +164,7 @@ function render() {
     const titleEl = $('#runtime-title');
     titleEl.textContent = r.setup_running ? '环境准备进行中…' : '首次使用：先补齐图形栈与官方 QQ 客户端';
     $('#runtime-desc').textContent = (r.setup_running
-      ? '正在下载解包，点「立即准备」查看进度。'
+      ? '正在解包/下载运行时组件（本地有缓存时不会重新下载），点「立即准备」查看进度；准备完会自动把账号拉起来。'
       : '缺少：' + (r.missing || []).join('、') + '。点右侧按钮，在页面里一键完成，无需 SSH / root / Docker。');
     $('#btn-setup').textContent = r.setup_running ? '查看进度' : '立即准备';
   } else banner.classList.add('hidden');

@@ -26,7 +26,12 @@ PIDFILE="${PKGVAR}/panel.pid"
 LOGFILE="${PKGVAR}/panel.log"
 SERVER_DIR="${APPDEST}/panel"
 STATIC_DIR="${APPDEST}/ui"
-RUNTIME_DIR="${APPDEST}/runtime"
+# 运行时（QQ 客户端 + deb 依赖库 + noVNC）必须放在持久化目录：
+# ${APPDEST} 是安装目录，升级 fpk 会整体覆盖，运行时放这里就会每次更新后丢失，
+# 面板显示「图形栈未就绪 · 缺少 qq」。改放数据目录（与账号数据同级，升级保留）。
+DATA_DIR="${QQFARM_DATA_DIR:-${TRIM_DATA_SHARE_PATHS%%:*}}"
+[ -n "$DATA_DIR" ] || DATA_DIR="${PKGVAR}/data"
+RUNTIME_DIR="${QQFARM_RUNTIME_DIR:-${DATA_DIR}/runtime}"
 PORT="${QQFARM_PORT:-8788}"
 
 log()  { echo "[${APPNAME}] $*"; }
@@ -110,8 +115,6 @@ start_service() {
   [ -f "$MANIFEST" ] || MANIFEST="${APPDEST}/../manifest"
   [ -f "$MANIFEST" ] && export QQFARM_MANIFEST="$MANIFEST"
 
-  DATA_DIR="${QQFARM_DATA_DIR:-${TRIM_DATA_SHARE_PATHS%%:*}}"
-  [ -n "$DATA_DIR" ] || DATA_DIR="${PKGVAR}/data"
   export QQFARM_DATA_DIR="$DATA_DIR"
   mkdir -p "$DATA_DIR" 2>/dev/null
 
