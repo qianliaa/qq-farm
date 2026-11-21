@@ -185,7 +185,19 @@ native/                          原生 FPK 源码
 └── wizard/                     安装 / 配置 / 卸载向导
 tools/build-native.sh           构建脚本（--online / --bundle / --slim）
 tools/build-native-check.py     源码校验
+tools/hide-qq-window.py         临时隐藏 / 恢复 QQ 窗口（实测空闲 CPU 用）
 tools/test_native_panel.py      面板端到端自测（mock 进程与下载）
 tools/test_native_diag.py       崩溃诊断 / 色深 / 更新检查
 tools/test_native_runtime.py    运行时与部署方式
 ```
+
+排查挂机 CPU 时，可以先确认是哪个进程在消耗：
+
+```bash
+top -b -n2 -d1 -p "$(pgrep -d, -f '/opt/QQ/qq')" | tail -25   # 第二帧才是瞬时值
+python3 tools/hide-qq-window.py --display :101 --list          # 只看，不改
+python3 tools/hide-qq-window.py --display :101 --unmap         # 隐藏窗口，测 CPU 是否下降
+python3 tools/hide-qq-window.py --display :101 --map           # 恢复
+```
+
+隐藏窗口只影响画面刷新，QQ 进程与登录态不变；网页桌面在隐藏期间会显示黑屏。
