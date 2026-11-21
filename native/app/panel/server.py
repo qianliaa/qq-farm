@@ -295,6 +295,34 @@ def save_state() -> None:
 def save_sessions() -> None:
     with LOCK:
         atomic_write(SESSION_FILE, SESSIONS)
+def _vnc_keeper_loop() -> None:
+    """定期重启 x11vnc，规避其长时间运行后 CPU 爬满的已知问题。
+
+    只重启 x11vnc，不动 QQ 与 Xvfb；检测到有人正在查看网页桌面时跳过，
+    避免打断扫码/操作。周期由 QQFARM_VNC_RESTART_HOURS 控制，默认 12
+    小时，设为 0 或负数关闭。
+    """
+    try:
+        hours = float(os.environ.get("QQFARM_VNC_RESTART_HOURS", "12") or 0)
+    except ValueError:
+        hours = 12.0
+    if hours <= 0:
+        log("VNC 定期重启已关闭（QQFARM_VNC_RESTART_HOURS<=0）")
+        return
+    log(f"VNC 定期重启已启用：x11vnc 运行满 {hours:g} 小时且无人查看时自动重启")
+    while True:
+        time.sleep(1800)
+        try:
+            pm = PM
+            if pm is None:
+                continue
+            for acc in list(STATE.get("accounts") or []):
+                if acc.get("enabled"):
+                    pm.maybe_restart_vnc(acc, hours)
+        except Exception as exc:
+            log(f"VNC 定期重启异常：{exc}")
+
+
 def init_process_manager() -> None:
     global PM, BOOT_ERROR
     try:
@@ -1000,6 +1028,8 @@ def run(host: str = "0.0.0.0", port: int | None = None):
         migrate_runtime()
         init_storage()
         init_process_manager()
+        threading.Thread(target=_vnc_keeper_loop, name="qqfarm-vnckeeper",
+                         daemon=True).start()
         restore_accounts()
         auto_restore_runtime()
         if PM and STATE["settings"].get("watchdog", True):

@@ -95,7 +95,7 @@ function startRefresh() {
   stopRefresh();
   REFRESH_TIMER = setInterval(() => {
     if ($('#auto-refresh').checked && document.visibilityState === 'visible') refresh(true);
-  }, 12000);
+  }, 30000);
 }
 async function boot() {
   let info;

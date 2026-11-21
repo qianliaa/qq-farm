@@ -66,6 +66,9 @@ class ProcessManager:
         self.lock = threading.RLock()
         self.groups: dict[str, dict] = {}  # acc_id -> {"procs": {role: Popen}, "started": ts}
         self._lib_dirs_cache: list[str] | None = None
+        # x11vnc 计划内重启的极短窗口：status() 仍按运行中上报，
+        # 避免看门狗误判为 partial 后把整组 QQ 一起重启。
+        self._vnc_restarting: set[str] = set()
         (self.data_dir / "accounts").mkdir(parents=True, exist_ok=True)
         (self.data_dir / "logs").mkdir(parents=True, exist_ok=True)
         self._load_pids()
@@ -215,6 +218,9 @@ class ProcessManager:
         env["MESA_GL_VERSION_OVERRIDE"] = "3.3"
         env["QT_X11_NO_MITSHM"] = "1"
         env["QT_OPENGL"] = "software"
+        # glibc 会按 CPU 核数创建 malloc arena；Electron 多进程
+        # 多线程场景下限制为 2 个，降低常驻内存与分配开销。
+        env["MALLOC_ARENA_MAX"] = "2"
         # fnOS 注入的 DBUS_SESSION_BUS_ADDRESS 常是非法值，会让 Qt/Electron 反复刷
         # "Could not parse server address: Unknown address type"。直接清掉即可，
         # Chromium/Qt 在没有 session bus 时会走无 D-Bus 的降级路径（非致命）。
@@ -236,6 +242,96 @@ class ProcessManager:
         proc = subprocess.Popen(cmd, **kwargs)
         self.log(f"启动 {name}: acc={acc['id']} pid={proc.pid} cmd={' '.join(cmd[:4])}")
         return proc
+
+    # ---------- VNC 维护 ----------
+    def _proc_argv(self, pid: int) -> list[str]:
+        """读取正在运行的进程命令行，重启时原样复用。"""
+        try:
+            with open(f"/proc/{int(pid)}/cmdline", "rb") as fh:
+                raw = fh.read().split(b"\0")
+            return [p.decode("utf-8", "replace") for p in raw if p]
+        except (OSError, ValueError):
+            return []
+
+    def _vnc_argv(self, acc: dict) -> list[str]:
+        """x11vnc 的兜底启动参数（读不到原命令行时使用）。"""
+        return [
+            self.resolve_bin("x11vnc"),
+            "-display", f":{acc['display']}",
+            "-rfbport", str(acc["vnc_port"]),
+            "-listen", "127.0.0.1",
+            "-forever", "-shared", "-nopw", "-noxdamage", "-quiet",
+            "-defer", "40",
+        ]
+
+    def _vnc_has_client(self, port: int) -> bool:
+        """VNC 端口上是否有已建立的连接（有人在看网页桌面）。"""
+        if os.name != "posix":
+            return False
+        for name in ("/proc/net/tcp", "/proc/net/tcp6"):
+            try:
+                with open(name, encoding="ascii", errors="ignore") as fh:
+                    next(fh, None)
+                    for line in fh:
+                        parts = line.split()
+                        if len(parts) < 4:
+                            continue
+                        try:
+                            lport = int(parts[1].rsplit(":", 1)[1], 16)
+                        except (IndexError, ValueError):
+                            continue
+                        # 01 = TCP_ESTABLISHED
+                        if lport == int(port) and parts[3] == "01":
+                            return True
+            except OSError:
+                pass
+        return False
+
+    def maybe_restart_vnc(self, acc: dict, max_age_hours: float) -> bool:
+        """x11vnc 长时间运行后 CPU 可能爬满（上游已知问题）；定期重启规避。
+
+        只重启 x11vnc，QQ 与 Xvfb 不动，登录态不受影响。当前有人查看
+        网页桌面时跳过，避免打断扫码/操作。
+        """
+        if max_age_hours <= 0:
+            return False
+        with self.lock:
+            group = self.groups.get(acc["id"])
+            if not group:
+                return False
+            proc = group["procs"].get("x11vnc")
+            if proc is None or proc.poll() is not None:
+                return False
+            started = group.get("starts", {}).get("x11vnc", 0)
+            age = time.time() - started
+            if age < max_age_hours * 3600:
+                return False
+            if self._vnc_has_client(int(acc["vnc_port"])):
+                self.log(f"VNC 已运行 {age / 3600:.1f}h，但当前有人查看，"
+                         f"跳过重启（acc={acc['id']}）")
+                return False
+            self.log(f"VNC 已运行 {age / 3600:.1f}h，按计划重启 x11vnc"
+                     f"（acc={acc['id']}，不影响 QQ）")
+            argv = self._proc_argv(proc.pid) or self._vnc_argv(acc)
+            # 标记「计划内重启」：避免看门狗在旧进程已退出、新进程未起来的
+            # 极短窗口里误判为 partial 并把整组 QQ 一起重启。
+            self._vnc_restarting.add(acc["id"])
+            try:
+                self._kill_proc(proc)
+                try:
+                    with self.log_file(acc["id"]).open("a", encoding="utf-8") as fh:
+                        fh.write(f"\n===== 定期重启 VNC {time.strftime('%F %T')} =====\n")
+                        group["procs"]["x11vnc"] = self._spawn(
+                            "x11vnc", argv, acc, fh)
+                except Exception as exc:
+                    self.log(f"重启 x11vnc 失败：{exc}")
+                    return False
+                group.setdefault("starts", {})["x11vnc"] = time.time()
+                self._save_pids()
+                return True
+            finally:
+                self._vnc_restarting.discard(acc["id"])
+
     # ---------- 启停 ----------
     def start(self, acc: dict) -> dict:
         with self.lock:
@@ -309,6 +405,17 @@ class ProcessManager:
                     "--use-gl=angle", "--use-angle=swiftshader",
                     "--in-process-gpu", "--enable-unsafe-swiftshader",
                     "--disable-features=Vulkan",
+                    # 低占用档：减少动画、后台任务与光栅线程，降低 NAS CPU
+                    "--enable-low-end-device-mode",
+                    "--force-prefers-reduced-motion",
+                    "--num-raster-threads=1",
+                    "--disable-background-networking",
+                    "--disable-component-update",
+                    "--disable-domain-reliability",
+                    "--disable-sync",
+                    "--no-service-autorun",
+                    "--disable-smooth-scrolling",
+                    "--force-device-scale-factor=1",
                     # NAS 无外网/无桌面会话时 Crashpad 会反复尝试上报并超时
                     #（日志里大量 curl_easy_perform: Timeout），纯浪费 CPU/网络/磁盘。
                     "--disable-crash-reporter", "--disable-breakpad",
@@ -431,9 +538,16 @@ class ProcessManager:
         now = time.time()
         state = {}
         exits = {}
+        restarting_vnc = acc["id"] in self._vnc_restarting
         for role in ("xvfb", "x11vnc", "qq"):
             p = procs.get(role)
-            state[role] = bool(p and p.poll() is None)
+            # 计划内重启 x11vnc 的极短窗口里按运行中上报，
+            # 避免看门狗把整组 QQ 一起重启。
+            state[role] = bool(p and p.poll() is None) or (
+                role == "x11vnc" and restarting_vnc)
+            # 计划内重启不算异常退出，别让面板闪一下「已退出」。
+            if role == "x11vnc" and restarting_vnc:
+                continue
             if p is not None and p.poll() is not None:
                 uptime = int(now - starts.get(role, now))
                 code = p.returncode
